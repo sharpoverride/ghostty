@@ -49,6 +49,8 @@ const log = std.log.scoped(.win32_window);
 
 const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
 const WS_VISIBLE: DWORD = 0x10000000;
+const WS_CHILD: DWORD = 0x40000000;
+const WS_CLIPSIBLINGS: DWORD = 0x04000000;
 const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
 const CS_HREDRAW: UINT = 0x0002;
 const CS_VREDRAW: UINT = 0x0001;
@@ -387,7 +389,7 @@ const EngineQueue = struct {
     }
 };
 
-pub fn create(alloc: Allocator) !*Self {
+pub fn create(alloc: Allocator, parent_hwnd: HWND) !*Self {
     // HMODULE and HINSTANCE are the same Win32 value (process module base)
     // but Zig models them as distinct opaque pointer types. Bridge with a
     // raw-pointer round-trip rather than @ptrCast (which doesn't compose).
@@ -428,16 +430,23 @@ pub fn create(alloc: Allocator) !*Self {
         .char_h = 16,
     };
 
+    // Child of the ParentWindow. ParentWindow manages chrome (title bar,
+    // tab strip) and positions us inside its client area via SetWindowPos.
+    // Non-zero initial size matters: the WGL context's back buffer is
+    // allocated at the size of the HDC's client area at SetPixelFormat
+    // time, and some drivers don't gracefully resize it from 0×0 later.
+    // 1024×640 matches the parent's initial geometry — ParentWindow's
+    // layoutActive will fit us to the actual client area right after.
     const hwnd = CreateWindowExW(
         0,
         class_name,
         window_title,
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
+        WS_CHILD | WS_CLIPSIBLINGS,
+        0,
+        0,
         1024,
         640,
-        null,
+        parent_hwnd,
         null,
         hinstance,
         @ptrCast(self),
@@ -473,11 +482,9 @@ pub fn create(alloc: Allocator) !*Self {
         _ = SelectObject(hdc, prev);
     }
 
-    _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
-    _ = UpdateWindow(hwnd);
-    // Take foreground + keyboard focus explicitly. Without this, when launched
-    // from a console the parent conhost keeps focus and WM_CHAR never arrives.
-    _ = SetForegroundWindow(hwnd);
+    // Child window: ShowWindow(SW_SHOW=5) to make visible. Parent owns
+    // the foreground/activation state.
+    _ = ShowWindow(hwnd, SW_SHOW);
     _ = SetFocus(hwnd);
 
     // Spin up the heartbeat watchdog. Posts WM_APP_HEARTBEAT every 2s so
@@ -809,10 +816,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_SIZE => forwardSize(hwnd, lparam),
-        WM_CLOSE, WM_DESTROY => {
-            PostQuitMessage(0);
-            return 0;
-        },
+        // Child window doesn't terminate the message pump on close —
+        // ParentWindow owns lifecycle (closing the parent posts WM_QUIT).
+        // We do still handle WM_DESTROY to fall through to DefWindowProcW
+        // cleanly.
+        WM_CLOSE, WM_DESTROY => {},
         else => {},
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);

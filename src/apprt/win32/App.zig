@@ -10,12 +10,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 const CoreApp = @import("../../App.zig");
+const ParentWindow = @import("ParentWindow.zig");
 const Surface = @import("Surface.zig");
 
 const log = std.log.scoped(.win32);
 
 core_app: *CoreApp,
-surface: ?*Surface = null,
+parent: ?*ParentWindow = null,
 
 pub fn init(
     self: *App,
@@ -27,17 +28,22 @@ pub fn init(
 }
 
 pub fn run(self: *App) !void {
-    log.info("App.run: creating surface", .{});
-    const surface = try Surface.create(self.core_app.alloc, self);
-    self.surface = surface;
+    log.info("App.run: creating parent window", .{});
+    const parent = try ParentWindow.create(self.core_app.alloc);
+    self.parent = parent;
     defer {
-        log.info("App.run: running surface.deinit", .{});
-        surface.deinit();
-        self.surface = null;
-        log.info("App.run: surface.deinit returned", .{});
+        log.info("App.run: parent.deinit", .{});
+        parent.deinit();
+        self.parent = null;
+        log.info("App.run: parent.deinit returned", .{});
     }
+
+    log.info("App.run: creating initial surface", .{});
+    const surface = try Surface.create(self.core_app.alloc, self, @ptrCast(parent.hwnd));
+    parent.attachSurface(surface);
+
     log.info("App.run: entering message pump", .{});
-    try surface.run();
+    try parent.run();
     log.info("App.run: message pump exited", .{});
 }
 

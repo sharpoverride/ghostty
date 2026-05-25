@@ -38,11 +38,11 @@ core_surface: CoreSurface,
 /// a fully-initialized engine-side CoreSurface (which spins up the renderer
 /// thread and the termio/ConPTY shell). The Surface pointer is stable —
 /// CoreSurface stores references back through `rt_surface = self`.
-pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
+pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self {
     const self = try alloc.create(Self);
     errdefer alloc.destroy(self);
 
-    const window = try Window.create(alloc);
+    const window = try Window.create(alloc, @ptrCast(parent_hwnd));
     errdefer window.deinit();
 
     // WGL context: must succeed for the renderer thread to attach. If we
@@ -117,10 +117,9 @@ pub fn deinit(self: *Self) void {
     self.alloc.destroy(self);
 }
 
-/// Drive the Win32 message pump on the calling thread until WM_QUIT.
-pub fn run(self: *Self) !void {
-    try self.window.run();
-}
+// NOTE: the win32 message pump used to live on Surface.run -> Window.run
+// when each Surface was a top-level window. With the parent/child split
+// the pump moves up to ParentWindow.run; Surface no longer drives it.
 
 /// Bind this Surface's GL context to the calling thread. Used by the
 /// OpenGL backend's `threadEnter` to take ownership on the render thread.
