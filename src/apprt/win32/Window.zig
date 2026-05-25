@@ -66,8 +66,11 @@ const WM_CLOSE: UINT = 0x0010;
 const WM_QUIT: UINT = 0x0012;
 const WM_ERASEBKGND: UINT = 0x0014;
 const WM_KEYDOWN: UINT = 0x0100;
+const WM_KEYUP: UINT = 0x0101;
 const WM_CHAR: UINT = 0x0102;
 const WM_SYSKEYDOWN: UINT = 0x0104;
+const WM_SYSKEYUP: UINT = 0x0105;
+const WM_SYSCHAR: UINT = 0x0106;
 const WM_CREATE: UINT = 0x0001;
 const WM_NCCREATE: UINT = 0x0081;
 const WM_APP: UINT = 0x8000;
@@ -205,6 +208,18 @@ extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) 
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) callconv(.winapi) isize;
 extern "user32" fn SetFocus(hWnd: ?HWND) callconv(.winapi) ?HWND;
 extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn GetKeyState(nVirtKey: i32) callconv(.winapi) i16;
+extern "user32" fn GetKeyboardState(lpKeyState: [*]u8) callconv(.winapi) BOOL;
+extern "user32" fn GetKeyboardLayout(idThread: DWORD) callconv(.winapi) ?*anyopaque;
+extern "user32" fn ToUnicodeEx(
+    wVirtKey: UINT,
+    wScanCode: UINT,
+    lpKeyState: [*]const u8,
+    pwszBuff: [*]u16,
+    cchBuff: i32,
+    wFlags: UINT,
+    dwhkl: ?*anyopaque,
+) callconv(.winapi) i32;
 
 extern "gdi32" fn CreateFontIndirectW(lplf: *const LOGFONTW) callconv(.winapi) HFONT;
 extern "gdi32" fn SelectObject(hdc: HDC, h: HGDIOBJ) callconv(.winapi) HGDIOBJ;
@@ -374,13 +389,19 @@ pub fn run(self: *Self) !void {
 
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
-        WM_CHAR => forwardChar(hwnd, wparam),
-        WM_SIZE => forwardSize(hwnd, lparam),
+        // WM_KEYDOWN handles EVERYTHING: text + special keys + modifiers.
+        // WM_CHAR is suppressed below so we don't get double input.
         WM_KEYDOWN, WM_SYSKEYDOWN => {
-            // Non-text keys (arrows, F-keys, etc) — B4 follow-up will map
-            // VK codes to input.Key and forward via keyCallback too.
-            log.debug("WM_KEY vk=0x{X} (TODO map to input.Key)", .{wparam});
+            forwardKey(hwnd, wparam, lparam, .press);
+            // Fall through to DefWindowProcW so system keys (Alt+F4 etc.)
+            // still work even if we forwarded them.
         },
+        WM_KEYUP, WM_SYSKEYUP => forwardKey(hwnd, wparam, lparam, .release),
+        // Eat WM_CHAR — we already handled the press via WM_KEYDOWN with
+        // ToUnicodeEx providing the utf8. Letting it through here would
+        // double-send every character to the pty.
+        WM_CHAR, WM_SYSCHAR => return 0,
+        WM_SIZE => forwardSize(hwnd, lparam),
         WM_CLOSE, WM_DESTROY => {
             PostQuitMessage(0);
             return 0;
@@ -396,15 +417,141 @@ fn recoverSelf(hwnd: HWND) ?*Self {
     return @ptrFromInt(@as(usize, @intCast(p)));
 }
 
-fn forwardChar(hwnd: HWND, wparam: WPARAM) void {
+fn currentMods() input.Mods {
+    return .{
+        .shift = (GetKeyState(0x10) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0, // VK_SHIFT
+        .ctrl = (GetKeyState(0x11) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0, // VK_CONTROL
+        .alt = (GetKeyState(0x12) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0, // VK_MENU
+    };
+}
+
+/// Map a Windows virtual-key code to an input.Key. Returns `.unidentified`
+/// for unmapped keys (those still forward — utf8 + mods carry meaning).
+fn vkToInputKey(vk: u32) input.Key {
+    return switch (vk) {
+        0x08 => .backspace,
+        0x09 => .tab,
+        0x0D => .enter,
+        0x10 => .shift_left,
+        0x11 => .control_left,
+        0x12 => .alt_left,
+        0x14 => .caps_lock,
+        0x1B => .escape,
+        0x20 => .space,
+        0x21 => .page_up,
+        0x22 => .page_down,
+        0x23 => .end,
+        0x24 => .home,
+        0x25 => .arrow_left,
+        0x26 => .arrow_up,
+        0x27 => .arrow_right,
+        0x28 => .arrow_down,
+        0x2D => .insert,
+        0x2E => .delete,
+        0x30 => .digit_0,
+        0x31 => .digit_1,
+        0x32 => .digit_2,
+        0x33 => .digit_3,
+        0x34 => .digit_4,
+        0x35 => .digit_5,
+        0x36 => .digit_6,
+        0x37 => .digit_7,
+        0x38 => .digit_8,
+        0x39 => .digit_9,
+        0x41 => .key_a,
+        0x42 => .key_b,
+        0x43 => .key_c,
+        0x44 => .key_d,
+        0x45 => .key_e,
+        0x46 => .key_f,
+        0x47 => .key_g,
+        0x48 => .key_h,
+        0x49 => .key_i,
+        0x4A => .key_j,
+        0x4B => .key_k,
+        0x4C => .key_l,
+        0x4D => .key_m,
+        0x4E => .key_n,
+        0x4F => .key_o,
+        0x50 => .key_p,
+        0x51 => .key_q,
+        0x52 => .key_r,
+        0x53 => .key_s,
+        0x54 => .key_t,
+        0x55 => .key_u,
+        0x56 => .key_v,
+        0x57 => .key_w,
+        0x58 => .key_x,
+        0x59 => .key_y,
+        0x5A => .key_z,
+        0x70 => .f1,
+        0x71 => .f2,
+        0x72 => .f3,
+        0x73 => .f4,
+        0x74 => .f5,
+        0x75 => .f6,
+        0x76 => .f7,
+        0x77 => .f8,
+        0x78 => .f9,
+        0x79 => .f10,
+        0x7A => .f11,
+        0x7B => .f12,
+        0xBA => .semicolon, // VK_OEM_1
+        0xBB => .equal, // VK_OEM_PLUS — also used for Ctrl+= font-size up
+        0xBC => .comma, // VK_OEM_COMMA
+        0xBD => .minus, // VK_OEM_MINUS — also used for Ctrl+- font-size down
+        0xBE => .period, // VK_OEM_PERIOD
+        0xBF => .slash, // VK_OEM_2
+        0xC0 => .backquote, // VK_OEM_3
+        0xDB => .bracket_left, // VK_OEM_4
+        0xDC => .backslash, // VK_OEM_5
+        0xDD => .bracket_right, // VK_OEM_6
+        0xDE => .quote, // VK_OEM_7
+        else => .unidentified,
+    };
+}
+
+/// Run ToUnicodeEx against the current keyboard state to derive the text
+/// that this key press generates with the user's layout. Caller passes the
+/// utf8 buffer; we return the byte count actually written (0 = no text).
+fn computeUtf8(vk: UINT, scan_code: UINT, utf8_buf: []u8) usize {
+    var state: [256]u8 = undefined;
+    if (GetKeyboardState(&state) == FALSE) return 0;
+    var utf16: [4]u16 = undefined;
+    const layout = GetKeyboardLayout(0);
+    const n = ToUnicodeEx(vk, scan_code, &state, &utf16, utf16.len, 0, layout);
+    if (n <= 0) return 0;
+    return std.unicode.utf16LeToUtf8(utf8_buf, utf16[0..@intCast(n)]) catch 0;
+}
+
+fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) void {
     const self = recoverSelf(hwnd) orelse return;
     const surface = self.surface orelse return;
-    const ch: u21 = @truncate(wparam);
-    var buf: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(ch, &buf) catch return;
-    const event: input.KeyEvent = .{ .utf8 = buf[0..len] };
+    const vk: u32 = @intCast(wparam);
+    const scan_code: u32 = @intCast((lparam >> 16) & 0xFF);
+    const key = vkToInputKey(vk);
+    const mods = currentMods();
+
+    // Compute utf8 from the key + layout. We do this only for press events
+    // and only when Ctrl/Alt aren't held — those combos go to the engine as
+    // .key + .mods so it can decide between a keybinding (Ctrl+R) and a
+    // VT encode (Ctrl+letter → control byte). Including utf8 in those would
+    // double-send.
+    var utf8_buf: [16]u8 = undefined;
+    var utf8: []const u8 = "";
+    if (action == .press and !mods.ctrl and !mods.alt) {
+        const n = computeUtf8(vk, scan_code, &utf8_buf);
+        utf8 = utf8_buf[0..n];
+    }
+
+    const event: input.KeyEvent = .{
+        .action = action,
+        .key = key,
+        .mods = mods,
+        .utf8 = utf8,
+    };
     _ = surface.core_surface.keyCallback(event) catch |e| {
-        log.warn("keyCallback err: {}", .{e});
+        log.warn("keyCallback err: vk=0x{X} key={} err={}", .{ vk, key, e });
     };
 }
 

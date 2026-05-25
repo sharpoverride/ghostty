@@ -181,6 +181,11 @@ pub const Context = struct {
             return error.MissingWglCreateContextAttribsARB;
         const create_attribs: WglCreateContextAttribsARB = @ptrCast(@alignCast(create_attribs_ptr));
 
+        // Best-effort: grab wglSwapIntervalEXT to disable vsync below. Vsync
+        // adds a frame of input-to-display latency that's brutally visible
+        // when the user types and waits 16ms+ for characters to appear.
+        const swap_interval_ptr: ?*anyopaque = wglGetProcAddress("wglSwapIntervalEXT");
+
         // Stage 2: 4.3 core context, with debug bit so GL_DEBUG_OUTPUT is
         // meaningful (OpenGL.zig enables it).
         const debug_flag: i32 = if (@import("builtin").mode == .Debug) WGL_CONTEXT_DEBUG_BIT_ARB else 0;
@@ -200,7 +205,19 @@ pub const Context = struct {
         _ = wglMakeCurrent(null, null);
         if (wglMakeCurrent(hdc, hglrc) == FALSE) return error.WglMakeCurrentRealFailed;
 
-        log.info("WGL context created hwnd=0x{X} pixel_format={d}", .{ @intFromPtr(hwnd), pixel_format });
+        // Disable vsync if the driver exposes the extension. The 4.3 context
+        // must be current for this to take effect.
+        if (swap_interval_ptr) |p| {
+            const SwapIntervalFn = *const fn (interval: i32) callconv(.winapi) BOOL;
+            const swap_interval: SwapIntervalFn = @ptrCast(@alignCast(p));
+            _ = swap_interval(0);
+        }
+
+        log.info("WGL context created hwnd=0x{X} pixel_format={d} vsync={s}", .{
+            @intFromPtr(hwnd),
+            pixel_format,
+            if (swap_interval_ptr == null) "ON (extension missing)" else "off",
+        });
 
         return .{ .hwnd = hwnd, .hdc = hdc, .hglrc = hglrc };
     }
