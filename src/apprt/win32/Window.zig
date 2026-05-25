@@ -243,6 +243,11 @@ const WM_APP: UINT = 0x8000;
 /// UTF-16 buffer. wparam = length (u16 units, incl. terminator),
 /// lparam = pointer cast to LPARAM. UI thread takes ownership of the buf.
 const WM_APP_SET_TITLE: UINT = WM_APP + 1;
+/// Custom message: heartbeat from the watchdog thread. UI thread logs and
+/// resets a counter so we can spot freezes — if the log stops showing
+/// heartbeat increments while the watchdog keeps posting, the UI message
+/// pump is wedged.
+const WM_APP_HEARTBEAT: UINT = WM_APP + 2;
 
 const MAPVK_VK_TO_CHAR: UINT = 2;
 
@@ -278,9 +283,100 @@ surface: ?*Surface = null,
 /// it outside of a move event.
 last_mouse_x: i32 = 0,
 last_mouse_y: i32 = 0,
+/// Watchdog: background thread posts WM_APP_HEARTBEAT every 2s. Diagnose
+/// UI-thread freezes — if the log stops showing heartbeats but the post
+/// keeps happening, the pump is wedged.
+heartbeat_thread: ?std.Thread = null,
+heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// Adapter thread: drains engine-bound events (keys, focus, size, mouse,
+/// scroll) and calls into CoreSurface callbacks. CoreSurface's callbacks
+/// push into per-thread mailboxes with `.forever` semantics — when the
+/// renderer / io_thread can't drain fast enough (e.g. a child process not
+/// reading stdin), the push blocks. Calling that from the UI thread wedges
+/// the message pump and the window appears frozen. Routing through the
+/// adapter keeps the UI thread non-blocking.
+engine_queue: EngineQueue = .{},
+engine_thread: ?std.Thread = null,
+engine_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWin32");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+
+// ---------------------------------------------------------------------------
+// EngineQueue: bounded ring buffer of input events, drained by a single
+// background adapter thread that calls into CoreSurface. UI thread only
+// enqueues — never blocks on engine work.
+// ---------------------------------------------------------------------------
+
+/// QueuedKey inlines the utf8 bytes (max 16 — far above any single
+/// keystroke's UTF-8 expansion) so the queue value owns its own backing
+/// store. The KeyEvent.utf8 slice is reconstructed at consume time from
+/// utf8_buf[0..utf8_len].
+const QueuedKey = struct {
+    action: input.Action,
+    key: input.Key,
+    mods: input.Mods,
+    unshifted_codepoint: u21,
+    utf8_buf: [16]u8 = [_]u8{0} ** 16,
+    utf8_len: u8 = 0,
+};
+
+const EngineEvent = union(enum) {
+    key: QueuedKey,
+    focus: bool,
+    size: apprt.SurfaceSize,
+    cursor_pos: apprt.CursorPos,
+    mouse_button: struct { state: input.MouseButtonState, button: input.MouseButton, mods: input.Mods },
+    scroll: struct { xoff: f64, yoff: f64 },
+};
+
+const EngineQueue = struct {
+    /// 256 deep — enough for ~4s of typing at 60 events/s. If full, oldest
+    /// non-key events get dropped (key events get logged + dropped too).
+    const CAP = 256;
+
+    buf: [CAP]EngineEvent = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    mu: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+
+    fn push(self: *EngineQueue, ev: EngineEvent) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const next = (self.tail + 1) % CAP;
+        if (next == self.head) {
+            // Full. Drop oldest to keep up with input bursts. Log so we
+            // can spot it if it ever happens under normal use.
+            log.warn("engine queue full, dropping oldest event", .{});
+            self.head = (self.head + 1) % CAP;
+        }
+        self.buf[self.tail] = ev;
+        self.tail = next;
+        self.cond.signal();
+    }
+
+    fn pop(self: *EngineQueue, stop: *std.atomic.Value(bool)) ?EngineEvent {
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (self.head == self.tail) {
+            if (stop.load(.seq_cst)) return null;
+            // Wake every 100ms so we periodically check the stop flag even
+            // if no events arrive — keeps shutdown bounded.
+            self.cond.timedWait(&self.mu, 100 * std.time.ns_per_ms) catch {};
+        }
+        const ev = self.buf[self.head];
+        self.head = (self.head + 1) % CAP;
+        return ev;
+    }
+
+    fn wake(self: *EngineQueue) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.cond.signal();
+    }
+};
 
 pub fn create(alloc: Allocator) !*Self {
     // HMODULE and HINSTANCE are the same Win32 value (process module base)
@@ -375,10 +471,89 @@ pub fn create(alloc: Allocator) !*Self {
     _ = SetForegroundWindow(hwnd);
     _ = SetFocus(hwnd);
 
+    // Spin up the heartbeat watchdog. Posts WM_APP_HEARTBEAT every 2s so
+    // we can detect a wedged UI pump in the log.
+    self.heartbeat_thread = std.Thread.spawn(.{}, heartbeatLoop, .{self}) catch |e| blk: {
+        log.warn("heartbeat thread spawn failed: {}", .{e});
+        break :blk null;
+    };
+
+    // Spin up the engine adapter thread. UI thread enqueues events here
+    // and returns; this thread drains the queue and calls into CoreSurface
+    // callbacks (which can block on engine mailboxes — fine, not the UI).
+    self.engine_thread = std.Thread.spawn(.{}, engineLoop, .{self}) catch |e| blk: {
+        log.warn("engine thread spawn failed (window will not respond to input): {}", .{e});
+        break :blk null;
+    };
+
     return self;
 }
 
+fn heartbeatLoop(self: *Self) void {
+    var seq: u32 = 0;
+    while (!self.heartbeat_stop.load(.seq_cst)) {
+        std.Thread.sleep(2 * std.time.ns_per_s);
+        seq +%= 1;
+        _ = PostMessageW(self.hwnd, WM_APP_HEARTBEAT, seq, 0);
+    }
+}
+
+fn engineLoop(self: *Self) void {
+    while (!self.engine_stop.load(.seq_cst)) {
+        const ev = self.engine_queue.pop(&self.engine_stop) orelse continue;
+        const surface = self.surface orelse continue;
+        switch (ev) {
+            .key => |k| {
+                // Reconstruct slice into THIS function's local copy of the
+                // QueuedKey value — the slice escapes only as far as the
+                // keyCallback call, which consumes synchronously.
+                var kk = k;
+                const kev: input.KeyEvent = .{
+                    .action = kk.action,
+                    .key = kk.key,
+                    .mods = kk.mods,
+                    .unshifted_codepoint = kk.unshifted_codepoint,
+                    .utf8 = kk.utf8_buf[0..kk.utf8_len],
+                };
+                _ = surface.core_surface.keyCallback(kev) catch |e| {
+                    log.warn("keyCallback err: {}", .{e});
+                };
+            },
+            .focus => |f| {
+                surface.core_surface.focusCallback(f) catch |e| {
+                    log.warn("focusCallback err: {}", .{e});
+                };
+            },
+            .size => |s| {
+                surface.core_surface.sizeCallback(s) catch |e| {
+                    log.warn("sizeCallback err: {}", .{e});
+                };
+            },
+            .cursor_pos => |p| {
+                surface.core_surface.cursorPosCallback(p, null) catch |e| {
+                    log.warn("cursorPosCallback err: {}", .{e});
+                };
+            },
+            .mouse_button => |m| {
+                _ = surface.core_surface.mouseButtonCallback(m.state, m.button, m.mods) catch |e| {
+                    log.warn("mouseButtonCallback err: {}", .{e});
+                };
+            },
+            .scroll => |s| {
+                surface.core_surface.scrollCallback(s.xoff, s.yoff, .{}) catch |e| {
+                    log.warn("scrollCallback err: {}", .{e});
+                };
+            },
+        }
+    }
+}
+
 pub fn deinit(self: *Self) void {
+    self.engine_stop.store(true, .seq_cst);
+    self.engine_queue.wake();
+    if (self.engine_thread) |t| t.join();
+    self.heartbeat_stop.store(true, .seq_cst);
+    if (self.heartbeat_thread) |t| t.join();
     if (self.font) |f| _ = DeleteObject(f);
     if (self.bg_brush) |b| _ = DeleteObject(b);
     self.alloc.destroy(self);
@@ -431,6 +606,8 @@ pub fn clientSize(self: *const Self) struct { width: u32, height: u32 } {
 /// Run the win32 message pump on the calling thread until WM_QUIT.
 pub fn run(self: *Self) !void {
     _ = self;
+    log.info("Window.run: message pump start", .{});
+    defer log.info("Window.run: message pump end", .{});
     var msg: MSG = undefined;
     while (true) {
         const r = GetMessageW(&msg, null, 0, 0);
@@ -490,6 +667,13 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             }
             return 0;
         },
+        WM_APP_HEARTBEAT => {
+            // If this stops appearing in the log while the watchdog thread
+            // is still posting, the UI message pump is wedged. The
+            // immediately preceding log lines should show what wedged it.
+            log.debug("heartbeat seq={d}", .{wparam});
+            return 0;
+        },
         WM_SIZE => forwardSize(hwnd, lparam),
         WM_CLOSE, WM_DESTROY => {
             PostQuitMessage(0);
@@ -502,15 +686,13 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
 
 fn forwardFocus(hwnd: HWND, focused: bool) void {
     const self = recoverSelf(hwnd) orelse return;
-    const surface = self.surface orelse return;
-    surface.core_surface.focusCallback(focused) catch |e| {
-        log.warn("focusCallback err: {}", .{e});
-    };
+    _ = self.surface orelse return;
+    self.engine_queue.push(.{ .focus = focused });
 }
 
 fn forwardWheel(hwnd: HWND, wparam: WPARAM, axis: enum { vertical, horizontal }) void {
     const self = recoverSelf(hwnd) orelse return;
-    const surface = self.surface orelse return;
+    _ = self.surface orelse return;
     // Delta lives in the high word as a signed 16-bit value. WHEEL_DELTA
     // (120) is one notch — Ghostty expects yoff in notches with positive
     // meaning "scroll up" / lines moving towards the user. Windows uses
@@ -520,9 +702,7 @@ fn forwardWheel(hwnd: HWND, wparam: WPARAM, axis: enum { vertical, horizontal })
     const notches: f64 = @as(f64, @floatFromInt(delta_i16)) / WHEEL_DELTA;
     const xoff: f64 = if (axis == .horizontal) notches else 0.0;
     const yoff: f64 = if (axis == .vertical) notches else 0.0;
-    surface.core_surface.scrollCallback(xoff, yoff, .{}) catch |e| {
-        log.warn("scrollCallback err: {}", .{e});
-    };
+    self.engine_queue.push(.{ .scroll = .{ .xoff = xoff, .yoff = yoff } });
 }
 
 /// Pull signed 16-bit x,y out of an lparam carrying client coordinates.
@@ -537,16 +717,14 @@ fn unpackXY(lparam: LPARAM) struct { x: i32, y: i32 } {
 
 fn forwardMouseMove(hwnd: HWND, lparam: LPARAM) void {
     const self = recoverSelf(hwnd) orelse return;
-    const surface = self.surface orelse return;
+    _ = self.surface orelse return;
     const xy = unpackXY(lparam);
     self.last_mouse_x = xy.x;
     self.last_mouse_y = xy.y;
-    surface.core_surface.cursorPosCallback(.{
+    self.engine_queue.push(.{ .cursor_pos = .{
         .x = @floatFromInt(xy.x),
         .y = @floatFromInt(xy.y),
-    }, null) catch |e| {
-        log.warn("cursorPosCallback err: {}", .{e});
-    };
+    } });
 }
 
 fn forwardMouseButton(
@@ -556,7 +734,7 @@ fn forwardMouseButton(
     capture: bool,
 ) void {
     const self = recoverSelf(hwnd) orelse return;
-    const surface = self.surface orelse return;
+    _ = self.surface orelse return;
 
     // SetCapture on left-button-down keeps WM_MOUSEMOVE flowing even when
     // the cursor leaves the client area — necessary for drag-selection that
@@ -569,10 +747,11 @@ fn forwardMouseButton(
         _ = ReleaseCapture();
     }
 
-    const mods = currentMods();
-    _ = surface.core_surface.mouseButtonCallback(state, button, mods) catch |e| {
-        log.warn("mouseButtonCallback err: {}", .{e});
-    };
+    self.engine_queue.push(.{ .mouse_button = .{
+        .state = state,
+        .button = button,
+        .mods = currentMods(),
+    } });
 }
 
 fn recoverSelf(hwnd: HWND) ?*Self {
@@ -714,7 +893,7 @@ fn computeUtf8(vk: UINT, scan_code: UINT, utf8_buf: []u8) usize {
 
 fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) void {
     const self = recoverSelf(hwnd) orelse return;
-    const surface = self.surface orelse return;
+    _ = self.surface orelse return;
     const vk: u32 = @intCast(wparam);
     const scan_code: u32 = @intCast((lparam >> 16) & 0xFF);
     const key = vkToInputKey(vk);
@@ -752,24 +931,53 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
         break :blk @intCast(ch);
     };
 
-    const event: input.KeyEvent = .{
+    log.debug("forwardKey vk=0x{X} action={s} mods=c{}/a{}/s{} unshifted=0x{X} utf8={X}", .{
+        vk,
+        @tagName(action),
+        @intFromBool(mods.ctrl),
+        @intFromBool(mods.alt),
+        @intFromBool(mods.shift),
+        @as(u32, unshifted),
+        utf8,
+    });
+
+    var qk: QueuedKey = .{
         .action = action,
         .key = key,
         .mods = mods,
-        .utf8 = utf8,
         .unshifted_codepoint = unshifted,
+        .utf8_len = @intCast(utf8.len),
     };
-    _ = surface.core_surface.keyCallback(event) catch |e| {
-        log.warn("keyCallback err: vk=0x{X} key={} err={}", .{ vk, key, e });
-    };
+    if (utf8.len > 0) @memcpy(qk.utf8_buf[0..utf8.len], utf8);
+
+    // Workaround for the lack of Kitty keyboard protocol / Win32 input
+    // mode: modified Enter in legacy encoding is indistinguishable from
+    // plain Enter (all send 0x0D). Many TUIs use Shift+Enter / Ctrl+Enter
+    // for "newline without submit" — Anthropic's claude CLI, prompt UIs,
+    // multi-line REPLs, etc. Substitute well-known sequences those
+    // programs typically branch on:
+    //   * Shift+Enter → ESC + CR ("Alt+Enter" semantics, broadly supported)
+    //   * Ctrl+Enter  → LF (0x0A), the ASCII Ctrl+J that ought to mean
+    //                   "true newline" rather than line-submit
+    // Apps that don't care see the bytes and process them as Enter.
+    if (action == .press and key == .enter) {
+        if (mods.shift) {
+            qk.utf8_buf[0] = 0x1B;
+            qk.utf8_buf[1] = 0x0D;
+            qk.utf8_len = 2;
+        } else if (mods.ctrl) {
+            qk.utf8_buf[0] = 0x0A;
+            qk.utf8_len = 1;
+        }
+    }
+
+    self.engine_queue.push(.{ .key = qk });
 }
 
 fn forwardSize(hwnd: HWND, lparam: LPARAM) void {
     const self = recoverSelf(hwnd) orelse return;
-    const surface = self.surface orelse return;
+    _ = self.surface orelse return;
     const w: u32 = @intCast(lparam & 0xFFFF);
     const h: u32 = @intCast((lparam >> 16) & 0xFFFF);
-    surface.core_surface.sizeCallback(.{ .width = w, .height = h }) catch |e| {
-        log.warn("sizeCallback err: {}", .{e});
-    };
+    self.engine_queue.push(.{ .size = .{ .width = w, .height = h } });
 }

@@ -27,13 +27,18 @@ pub fn init(
 }
 
 pub fn run(self: *App) !void {
+    log.info("App.run: creating surface", .{});
     const surface = try Surface.create(self.core_app.alloc, self);
     self.surface = surface;
     defer {
+        log.info("App.run: running surface.deinit", .{});
         surface.deinit();
         self.surface = null;
+        log.info("App.run: surface.deinit returned", .{});
     }
+    log.info("App.run: entering message pump", .{});
     try surface.run();
+    log.info("App.run: message pump exited", .{});
 }
 
 pub fn terminate(self: *App) void {

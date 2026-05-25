@@ -64,8 +64,20 @@ pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
     //     Windows Terminal, PuTTY, conhost).
     //   * right-click-action: copy-or-paste, i.e. if there's a selection
     //     copy it, otherwise paste — also WT behaviour.
+    // Applied BEFORE CLI parsing so the user can still override via
+    // `--copy-on-select=false` or a config file.
     config.@"copy-on-select" = .true;
     config.@"right-click-action" = .@"copy-or-paste";
+
+    // Parse the process command line. Supports the standard Ghostty CLI:
+    //   ghostty.exe --command="pwsh.exe -NoLogo"
+    //   ghostty.exe -e pwsh.exe -NoLogo
+    //   ghostty.exe --working-directory="E:\proj"
+    // loadCliArgs also flips `config-default-files = true` so a config
+    // file at %APPDATA%/ghostty/config gets picked up on the next pass.
+    config.loadCliArgs(alloc) catch |err| {
+        log.warn("loadCliArgs failed (continuing with defaults): {}", .{err});
+    };
 
     self.* = .{
         .alloc = alloc,
@@ -93,10 +105,15 @@ pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
 }
 
 pub fn deinit(self: *Self) void {
+    log.info("Surface.deinit: core_surface.deinit start", .{});
     self.core_surface.deinit();
+    log.info("Surface.deinit: core_surface.deinit returned", .{});
     self.config.deinit();
+    log.info("Surface.deinit: config.deinit returned", .{});
     self.gl_ctx.deinit();
+    log.info("Surface.deinit: gl_ctx.deinit returned", .{});
     self.window.deinit();
+    log.info("Surface.deinit: window.deinit returned", .{});
     self.alloc.destroy(self);
 }
 
