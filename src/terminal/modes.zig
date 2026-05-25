@@ -297,6 +297,13 @@ const entries: []const ModeEntry = &.{
     .{ .name = "grapheme_cluster", .value = 2027 },
     .{ .name = "report_color_scheme", .value = 2031 },
     .{ .name = "in_band_size_reports", .value = 2048 },
+    // Win32 input mode — conhost / Windows Terminal extension. When set,
+    // the terminal is expected to forward keyboard events as
+    // KEY_EVENT_RECORD-style escape sequences (ESC [ vk ; sc ; uc ; down
+    // ; ctrl ; rep _) so that programs can decode the original Win32
+    // event without the legacy translation. Tracked here so apprts can
+    // query the flag; the actual encoding lives in the apprt.
+    .{ .name = "win32_input_mode", .value = 9001 },
 };
 
 test {

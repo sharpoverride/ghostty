@@ -13,6 +13,8 @@ const windows = std.os.windows;
 const Allocator = std.mem.Allocator;
 const input = @import("../../input.zig");
 const apprt = @import("../../apprt.zig");
+const termio = @import("../../termio.zig");
+const terminal = @import("../../terminal/main.zig");
 const Surface = @import("Surface.zig");
 
 const HANDLE = windows.HANDLE;
@@ -299,6 +301,9 @@ heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 engine_queue: EngineQueue = .{},
 engine_thread: ?std.Thread = null,
 engine_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+/// Cached last-observed value of DEC 9001. Used by engineLoop to log
+/// transitions only (the check itself happens per-key event).
+win32_mode_last: bool = false,
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWin32");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -312,7 +317,9 @@ const window_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
 /// QueuedKey inlines the utf8 bytes (max 16 — far above any single
 /// keystroke's UTF-8 expansion) so the queue value owns its own backing
 /// store. The KeyEvent.utf8 slice is reconstructed at consume time from
-/// utf8_buf[0..utf8_len].
+/// utf8_buf[0..utf8_len]. Also carries the raw Win32 vk/scancode so
+/// the consumer can build a KEY_EVENT_RECORD-style escape sequence
+/// when the terminal has Win32 input mode (DEC 9001) enabled.
 const QueuedKey = struct {
     action: input.Action,
     key: input.Key,
@@ -320,6 +327,8 @@ const QueuedKey = struct {
     unshifted_codepoint: u21,
     utf8_buf: [16]u8 = [_]u8{0} ** 16,
     utf8_len: u8 = 0,
+    vk: u16 = 0,
+    scan: u16 = 0,
 };
 
 const EngineEvent = union(enum) {
@@ -498,26 +507,151 @@ fn heartbeatLoop(self: *Self) void {
     }
 }
 
+/// Format the KEY_EVENT_RECORD-style escape sequence used by conhost /
+/// Windows Terminal when Win32 input mode (DECSET 9001) is active and
+/// queue it as a small pty write. Layout:
+///
+///   ESC [ vk ; sc ; uc ; down ; ctrl ; rep _
+///
+/// where ctrl is the standard Win32 CONTROL_KEY_STATE bitmask:
+///   RIGHT_ALT=0x01, LEFT_ALT=0x02, RIGHT_CTRL=0x04, LEFT_CTRL=0x08,
+///   SHIFT=0x10, NUMLOCK=0x20, SCROLLLOCK=0x40, CAPSLOCK=0x80,
+///   ENHANCED_KEY=0x100.
+///
+/// We use the LEFT_* variants for ctrl/alt since the win32 apprt's
+/// `currentMods()` only tracks the combined VK_CONTROL / VK_MENU.
+fn sendWin32InputRecord(surface: *Surface, k: QueuedKey) void {
+    const down: u8 = switch (k.action) {
+        .press, .repeat => 1,
+        .release => 0,
+    };
+
+    var ctrl: u32 = 0;
+    if (k.mods.shift) ctrl |= 0x10;
+    if (k.mods.ctrl) ctrl |= 0x08; // LEFT_CTRL
+    if (k.mods.alt) ctrl |= 0x02; // LEFT_ALT
+    if (k.mods.caps_lock) ctrl |= 0x80;
+    if (k.mods.num_lock) ctrl |= 0x20;
+
+    // uChar.UnicodeChar must mirror what conhost would have produced for
+    // this physical key event. Most clients (claude included) use the
+    // uChar to decide between "this is text" vs "this is a control
+    // sequence" — get it wrong and Ctrl+C never terminates, Shift+Enter
+    // looks like plain Enter, etc.
+    //
+    //   Ctrl+letter (A..Z) → ASCII control byte (vk & 0x1F): 0x01..0x1A
+    //   Enter              → 0x0D normally, 0x0A under Ctrl
+    //   Tab / Backspace / Escape — fixed ASCII control bytes
+    //   Other keys         → whatever ToUnicodeEx already produced
+    //                        (sits in utf8_buf for non-Ctrl/Alt presses)
+    var uchar: u32 = 0;
+    if (k.mods.ctrl and !k.mods.alt and k.vk >= 0x41 and k.vk <= 0x5A) {
+        uchar = k.vk & 0x1F;
+    } else if (k.vk == 0x0D) {
+        uchar = if (k.mods.ctrl) 0x0A else 0x0D;
+    } else if (k.vk == 0x09) {
+        uchar = 0x09;
+    } else if (k.vk == 0x08) {
+        uchar = 0x08;
+    } else if (k.vk == 0x1B) {
+        uchar = 0x1B;
+    } else if (k.utf8_len > 0) {
+        const first = k.utf8_buf[0];
+        if (first < 0x80) {
+            uchar = first;
+        } else if (std.unicode.utf8ByteSequenceLength(first)) |expected| {
+            if (k.utf8_len == expected) {
+                if (std.unicode.utf8Decode(k.utf8_buf[0..k.utf8_len])) |cp| {
+                    uchar = @intCast(cp & 0xFFFF);
+                } else |_| {
+                    uchar = first;
+                }
+            } else {
+                uchar = first;
+            }
+        } else |_| {
+            uchar = first;
+        }
+    }
+
+    var buf: [38]u8 = undefined;
+    const seq = std.fmt.bufPrint(&buf, "\x1b[{};{};{};{};{};1_", .{
+        k.vk, k.scan, uchar, down, ctrl,
+    }) catch |e| {
+        log.warn("win32 record format failed: {}", .{e});
+        return;
+    };
+
+    var small: termio.Message.WriteReq.Small = .{};
+    small.len = @intCast(seq.len);
+    @memcpy(small.data[0..seq.len], seq);
+    surface.core_surface.io.queueMessage(.{ .write_small = small }, .unlocked);
+}
+
 fn engineLoop(self: *Self) void {
     while (!self.engine_stop.load(.seq_cst)) {
         const ev = self.engine_queue.pop(&self.engine_stop) orelse continue;
         const surface = self.surface orelse continue;
         switch (ev) {
             .key => |k| {
-                // Reconstruct slice into THIS function's local copy of the
-                // QueuedKey value — the slice escapes only as far as the
-                // keyCallback call, which consumes synchronously.
+                // Win32 input mode (DEC 9001): when set, the program wants
+                // raw KEY_EVENT_RECORD-style escape sequences for every
+                // key transition (down AND up, including bare modifiers)
+                // so it can decode original Win32 events without legacy
+                // translation. Bypass keyCallback entirely and write the
+                // record directly to the pty.
+                const term = &surface.core_surface.io.terminal;
+                const win32_mode = blk: {
+                    surface.core_surface.renderer_state.mutex.lock();
+                    defer surface.core_surface.renderer_state.mutex.unlock();
+                    break :blk term.modes.get(.win32_input_mode);
+                };
+                // Log transitions so we can correlate freezes / weird key
+                // behavior against whether the program opted into 9001.
+                if (win32_mode != self.win32_mode_last) {
+                    log.info("win32 input mode -> {}", .{win32_mode});
+                    self.win32_mode_last = win32_mode;
+                }
+
                 var kk = k;
-                const kev: input.KeyEvent = .{
-                    .action = kk.action,
-                    .key = kk.key,
-                    .mods = kk.mods,
-                    .unshifted_codepoint = kk.unshifted_codepoint,
-                    .utf8 = kk.utf8_buf[0..kk.utf8_len],
-                };
-                _ = surface.core_surface.keyCallback(kev) catch |e| {
-                    log.warn("keyCallback err: {}", .{e});
-                };
+                if (win32_mode) {
+                    sendWin32InputRecord(surface, kk);
+                } else {
+                    // Legacy encoding workaround for modified Enter: no
+                    // standard way to distinguish Shift+Enter / Ctrl+Enter
+                    // from plain Enter without Kitty keyboard protocol or
+                    // Win32 input mode. Substitute well-known sequences
+                    // that common TUIs (claude, multi-line REPLs) branch
+                    // on. Apps that don't care eat the prefix and process
+                    // the trailing CR/LF as Enter.
+                    //
+                    // We ALSO have to clear `.key` to `.unidentified` so
+                    // the engine's legacy encoder doesn't preempt our
+                    // .utf8 with the PC-style \r sequence for Enter.
+                    var override_key = false;
+                    if (kk.action == .press and kk.key == .enter) {
+                        if (kk.mods.shift) {
+                            kk.utf8_buf[0] = 0x1B; // ESC + CR
+                            kk.utf8_buf[1] = 0x0D;
+                            kk.utf8_len = 2;
+                            override_key = true;
+                        } else if (kk.mods.ctrl) {
+                            kk.utf8_buf[0] = 0x0A; // LF
+                            kk.utf8_len = 1;
+                            override_key = true;
+                        }
+                    }
+                    const kev: input.KeyEvent = .{
+                        .action = kk.action,
+                        .key = if (override_key) .unidentified else kk.key,
+                        .mods = if (override_key) .{} else kk.mods,
+                        .unshifted_codepoint = if (override_key) 0 else kk.unshifted_codepoint,
+                        .utf8 = kk.utf8_buf[0..kk.utf8_len],
+                    };
+                    _ = surface.core_surface.keyCallback(kev) catch |e| {
+                        log.warn("keyCallback err: {}", .{e});
+                    };
+                }
             },
             .focus => |f| {
                 surface.core_surface.focusCallback(f) catch |e| {
@@ -685,6 +819,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
 }
 
 fn forwardFocus(hwnd: HWND, focused: bool) void {
+    log.info("focus change: focused={}", .{focused});
     const self = recoverSelf(hwnd) orelse return;
     _ = self.surface orelse return;
     self.engine_queue.push(.{ .focus = focused });
@@ -947,29 +1082,15 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
         .mods = mods,
         .unshifted_codepoint = unshifted,
         .utf8_len = @intCast(utf8.len),
+        .vk = @intCast(vk),
+        .scan = @intCast(scan_code),
     };
     if (utf8.len > 0) @memcpy(qk.utf8_buf[0..utf8.len], utf8);
 
-    // Workaround for the lack of Kitty keyboard protocol / Win32 input
-    // mode: modified Enter in legacy encoding is indistinguishable from
-    // plain Enter (all send 0x0D). Many TUIs use Shift+Enter / Ctrl+Enter
-    // for "newline without submit" — Anthropic's claude CLI, prompt UIs,
-    // multi-line REPLs, etc. Substitute well-known sequences those
-    // programs typically branch on:
-    //   * Shift+Enter → ESC + CR ("Alt+Enter" semantics, broadly supported)
-    //   * Ctrl+Enter  → LF (0x0A), the ASCII Ctrl+J that ought to mean
-    //                   "true newline" rather than line-submit
-    // Apps that don't care see the bytes and process them as Enter.
-    if (action == .press and key == .enter) {
-        if (mods.shift) {
-            qk.utf8_buf[0] = 0x1B;
-            qk.utf8_buf[1] = 0x0D;
-            qk.utf8_len = 2;
-        } else if (mods.ctrl) {
-            qk.utf8_buf[0] = 0x0A;
-            qk.utf8_len = 1;
-        }
-    }
+    // Modified-Enter workaround is applied in the LEGACY branch of the
+    // engine adapter (see engineLoop). Win32 input mode carries the
+    // shift / ctrl state natively in the record's control_keys field,
+    // so the substitution would only confuse it.
 
     self.engine_queue.push(.{ .key = qk });
 }
