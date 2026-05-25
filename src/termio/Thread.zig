@@ -331,6 +331,7 @@ fn drainMailbox(
             },
             .jump_to_prompt => |v| try io.jumpToPrompt(v),
             .start_synchronized_output => self.startSynchronizedOutput(cb),
+            .end_synchronized_output => self.endSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),
             .write_small => |v| try io.queueWrite(
@@ -371,6 +372,31 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
         cb,
         syncResetCallback,
     );
+}
+
+fn endSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
+    // Cancel the safety timer (no-op if it isn't armed) and immediately
+    // resume rendering. Without this, programs that issue rapid begin
+    // pulses with paired ends keep starving the timer reset and the
+    // renderer never redraws.
+    self.sync_reset.cancel(
+        &self.loop,
+        &self.sync_reset_c,
+        &self.sync_reset_cancel_c,
+        void,
+        null,
+        (struct {
+            fn cb_(
+                _: ?*void,
+                _: *xev.Loop,
+                _: *xev.Completion,
+                _: xev.Timer.CancelError!void,
+            ) xev.CallbackAction {
+                return .disarm;
+            }
+        }).cb_,
+    );
+    cb.io.resetSynchronizedOutput();
 }
 
 fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {

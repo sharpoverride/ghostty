@@ -740,7 +740,15 @@ pub const StreamHandler = struct {
             // We need to start a timer to prevent the emulator being hung
             // forever.
             .synchronized_output => {
-                if (enabled) self.messageWriter(.{ .start_synchronized_output = {} });
+                if (enabled) {
+                    self.messageWriter(.{ .start_synchronized_output = {} });
+                } else {
+                    // Cancel the safety timer + wake the renderer so we
+                    // draw the final synchronized state immediately. Without
+                    // this, programs that emit rapid begin/end pairs keep
+                    // resetting the safety timer and starve rendering.
+                    self.messageWriter(.{ .end_synchronized_output = {} });
+                }
             },
 
             .linefeed => {

@@ -67,6 +67,12 @@ pub const Message = union(enum) {
     /// period of time so that a bad actor can't hang the terminal.
     start_synchronized_output: void,
 
+    /// Send this when the program disables synchronized output mode
+    /// (DEC 2026 reset). Cancels the safety timer and immediately
+    /// resumes rendering. Required so that a program issuing rapid
+    /// begin-sync pulses still gets timely renders between them.
+    end_synchronized_output: void,
+
     /// Enable or disable linefeed mode (mode 20).
     linefeed_mode: bool,
 
