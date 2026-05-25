@@ -4659,6 +4659,7 @@ pub fn finalize(self: *Config) !void {
                     .true,
             }
         },
+        .win32 => {},
     }
 
     // Default our click interval

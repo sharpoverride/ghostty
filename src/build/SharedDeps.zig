@@ -605,6 +605,7 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtkNg(step),
+            .win32 => try self.addWin32(step),
         }
     }
 
@@ -751,6 +752,22 @@ fn addGtkNg(
         step.addCSourceFile(.{ .file = dist.resources_c.path(b), .flags = &.{} });
         step.addIncludePath(dist.resources_h.path(b).dirname());
     }
+}
+
+/// Setup the dependencies for the native Win32 apprt.
+///
+/// Current scope: kernel32 + user32 + gdi32 + opengl32 cover the HWND +
+/// ConPTY + WGL bring-up paths. Future D3D11 work will add d3d11,
+/// d3dcompiler, dxgi, dwrite, shell32, ole32, imm32.
+fn addWin32(
+    self: *const SharedDeps,
+    step: *std.Build.Step.Compile,
+) !void {
+    _ = self;
+    step.linkSystemLibrary2("kernel32", .{});
+    step.linkSystemLibrary2("user32", .{});
+    step.linkSystemLibrary2("gdi32", .{});
+    step.linkSystemLibrary2("opengl32", .{});
 }
 
 /// Add only the dependencies required for `Config.simd` enabled. This also

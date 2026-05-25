@@ -160,8 +160,6 @@ fn prepareContext(getProcAddress: anytype) !void {
 
 /// This is called early right after surface creation.
 pub fn surfaceInit(surface: *apprt.Surface) !void {
-    _ = surface;
-
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
@@ -173,6 +171,17 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
             // broken for rendering on this platforms.
+        },
+
+        // Win32 must load glad here on the UI thread because Renderer.init
+        // (called shortly after this) creates GL buffers/shaders. We bind
+        // our context on the UI thread, load function pointers, and leave
+        // it current — finalizeSurfaceInit hands it off to the renderer
+        // thread by clearing the UI-thread binding.
+        apprt.win32 => {
+            const win32_gl = @import("../apprt/win32/gl.zig");
+            try surface.glMakeCurrent();
+            try prepareContext(&win32_gl.getProcAddress);
         },
     }
 
@@ -190,13 +199,21 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 /// thread for final main thread setup requirements.
 pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
+
+    switch (apprt.runtime) {
+        // Win32: release the WGL context on the UI thread so the renderer
+        // thread can claim it in `threadEnter`. A WGL context can only be
+        // current on one thread at a time.
+        apprt.win32 => surface.glClearCurrent(),
+
+        // GTK + embedded share global contexts (or none); nothing to do.
+        else => {},
+    }
 }
 
 /// Callback called by renderer.Thread when it begins.
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
 
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
@@ -212,6 +229,15 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
             // broken for rendering on this platforms.
+        },
+
+        // Win32 owns its own per-surface WGL context. Bind it to this
+        // render thread and load glad against our wglGetProcAddress /
+        // opengl32.dll fallback loader.
+        apprt.win32 => {
+            const win32_gl = @import("../apprt/win32/gl.zig");
+            try surface.glMakeCurrent();
+            try prepareContext(&win32_gl.getProcAddress);
         },
     }
 }
@@ -230,6 +256,13 @@ pub fn threadExit(self: *const OpenGL) void {
 
         apprt.embedded => {
             // TODO: see threadEnter
+        },
+
+        apprt.win32 => {
+            // Unbind the WGL context from this thread. The Surface still
+            // owns the (hdc, hglrc) pair and will destroy them on deinit.
+            const win32_gl = @import("../apprt/win32/gl.zig");
+            win32_gl.clearCurrentThread();
         },
     }
 }
@@ -250,10 +283,24 @@ pub fn displayRealized(self: *const OpenGL) void {
 }
 
 /// Actions taken before doing anything in `drawFrame`.
-///
-/// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameStart(self: *OpenGL) void {
     _ = self;
+
+    switch (apprt.runtime) {
+        // Win32: nothing on this platform auto-updates GL_VIEWPORT when the
+        // HWND resizes, so the renderer (which queries `surfaceSize` →
+        // GL_VIEWPORT to detect screen-size changes) would otherwise be
+        // wedged at the initial size. Sync GL_VIEWPORT to the current HWND
+        // client rect on every frame.
+        apprt.win32 => {
+            const win32_gl = @import("../apprt/win32/gl.zig");
+            if (win32_gl.currentDrawableSize()) |sz| {
+                gl.glad.context.Viewport.?(0, 0, @intCast(sz.w), @intCast(sz.h));
+            }
+        },
+
+        else => {},
+    }
 }
 
 /// Actions taken after `drawFrame` is done.
@@ -328,6 +375,14 @@ pub fn present(self: *OpenGL, target: Target) !void {
 
     // Keep track of this target in case we need to repeat it.
     self.last_target = target;
+
+    // Apprt-specific swap. GTK relies on GdkGLArea's implicit swap on the
+    // draw signal return, embedded leaves presentation to the host, so only
+    // win32 needs an explicit SwapBuffers on its double-buffered HDC.
+    switch (apprt.runtime) {
+        apprt.win32 => @import("../apprt/win32/gl.zig").swapCurrent(),
+        else => {},
+    }
 }
 
 /// Present the last presented target again.
