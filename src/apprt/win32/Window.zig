@@ -85,8 +85,6 @@ const WM_SYSKEYUP: UINT = 0x0105;
 const WM_SYSCHAR: UINT = 0x0106;
 const WM_CREATE: UINT = 0x0001;
 const WM_NCCREATE: UINT = 0x0081;
-const WM_APP: UINT = 0x8000;
-const WM_PTY_READY: UINT = WM_APP + 1;
 
 // Virtual-Key codes we care about for terminal input.
 const VK_RETURN: WPARAM = 0x0D;
@@ -215,6 +213,8 @@ extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BO
 // that to an aligned [*:0]const u16, so accept usize and let Win32 do its
 // magic at the FFI boundary.
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: usize) callconv(.winapi) HCURSOR;
+// Same MAKEINTRESOURCE trick as LoadCursorW: pass the integer ID via usize.
+extern "user32" fn LoadIconW(hInstance: ?HINSTANCE, lpIconName: usize) callconv(.winapi) HICON;
 extern "user32" fn GetStockObject(i: i32) callconv(.winapi) HGDIOBJ;
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) callconv(.winapi) isize;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) callconv(.winapi) isize;
@@ -235,6 +235,14 @@ extern "user32" fn ToUnicodeEx(
 extern "user32" fn MapVirtualKeyW(uCode: UINT, uMapType: UINT) callconv(.winapi) UINT;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: LPCWSTR) callconv(.winapi) BOOL;
+extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
+
+const WM_APP: UINT = 0x8000;
+/// Custom message: UI thread should set the window title from a heap
+/// UTF-16 buffer. wparam = length (u16 units, incl. terminator),
+/// lparam = pointer cast to LPARAM. UI thread takes ownership of the buf.
+const WM_APP_SET_TITLE: UINT = WM_APP + 1;
 
 const MAPVK_VK_TO_CHAR: UINT = 2;
 
@@ -293,6 +301,11 @@ pub fn create(alloc: Allocator) !*Self {
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hinstance;
     wc.hCursor = LoadCursorW(null, IDC_IBEAM);
+    // ghostty.rc declares ID_ICON_GHOSTTY = 1 for ghostty.ico. Load it from
+    // our own module's embedded resources so the title bar + taskbar show
+    // the proper icon rather than the IDI_APPLICATION default.
+    wc.hIcon = LoadIconW(hinstance, 1);
+    wc.hIconSm = LoadIconW(hinstance, 1);
     wc.hbrBackground = bg_brush;
     wc.lpszClassName = class_name;
     // RegisterClassExW may fail if the class is already registered; ignore.
@@ -371,6 +384,39 @@ pub fn deinit(self: *Self) void {
     self.alloc.destroy(self);
 }
 
+/// Set the window title bar text from a UTF-8 string. Safe to call from
+/// ANY thread — the engine often invokes us from the IO/renderer thread
+/// when the shell emits OSC 0/2. Calling SetWindowTextW directly from a
+/// non-owner thread degrades into a cross-thread SendMessage(WM_SETTEXT)
+/// that BLOCKS the caller until the UI thread pumps. Under load (rapid
+/// title updates while UI is busy) that path deadlocks the engine.
+///
+/// We instead allocate a UTF-16 buffer on the (thread-safe) c_allocator,
+/// PostMessageW our custom WM_APP_SET_TITLE, and the UI thread's WndProc
+/// calls SetWindowTextW locally + frees the buffer.
+pub fn setTitle(self: *const Self, title: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    var buf = try alloc.alloc(u16, title.len + 1);
+    errdefer alloc.free(buf);
+    const written = try std.unicode.utf8ToUtf16Le(buf, title);
+    buf[written] = 0;
+
+    const ptr_lparam: LPARAM = @bitCast(@as(usize, @intFromPtr(buf.ptr)));
+    const len_wparam: WPARAM = @intCast(buf.len);
+    if (PostMessageW(self.hwnd, WM_APP_SET_TITLE, len_wparam, ptr_lparam) == FALSE) {
+        // Queue full / window gone — drop the title silently, free the buf.
+        alloc.free(buf);
+        return;
+    }
+    // Buffer ownership now belongs to the queued message; WndProc frees.
+}
+
+/// Ring the system default beep — no payload, just a notify on terminal BEL.
+pub fn ringBell(self: *const Self) void {
+    _ = self;
+    _ = MessageBeep(0xFFFFFFFF); // MB_OK (system default sound)
+}
+
 /// Return the current client-area size of this Window. Used by Surface to
 /// satisfy apprt's `getSize` contract without exposing the HWND.
 pub fn clientSize(self: *const Self) struct { width: u32, height: u32 } {
@@ -434,6 +480,16 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_MBUTTONUP => forwardMouseButton(hwnd, .middle, .release, false),
         WM_MOUSEWHEEL => forwardWheel(hwnd, wparam, .vertical),
         WM_MOUSEHWHEEL => forwardWheel(hwnd, wparam, .horizontal),
+        WM_APP_SET_TITLE => {
+            const len: usize = @intCast(wparam);
+            const ptr_int: usize = @bitCast(lparam);
+            if (ptr_int != 0 and len > 0) {
+                const ptr: [*]u16 = @ptrFromInt(ptr_int);
+                _ = SetWindowTextW(hwnd, @ptrCast(ptr));
+                std.heap.c_allocator.free(ptr[0..len]);
+            }
+            return 0;
+        },
         WM_SIZE => forwardSize(hwnd, lparam),
         WM_CLOSE, WM_DESTROY => {
             PostQuitMessage(0);
@@ -646,7 +702,12 @@ fn computeUtf8(vk: UINT, scan_code: UINT, utf8_buf: []u8) usize {
     if (GetKeyboardState(&state) == FALSE) return 0;
     var utf16: [4]u16 = undefined;
     const layout = GetKeyboardLayout(0);
-    const n = ToUnicodeEx(vk, scan_code, &state, &utf16, utf16.len, 0, layout);
+    // wFlags = 4 (Win10+) tells ToUnicodeEx NOT to mutate the kernel's
+    // dead-key state. Without this, layouts with dead keys (Romanian
+    // Standard, German, etc.) accumulate stuck state between calls and
+    // suppress translation of subsequent keys — manifest as random
+    // characters silently disappearing.
+    const n = ToUnicodeEx(vk, scan_code, &state, &utf16, utf16.len, 4, layout);
     if (n <= 0) return 0;
     return std.unicode.utf16LeToUtf8(utf8_buf, utf16[0..@intCast(n)]) catch 0;
 }
@@ -658,6 +719,12 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
     const scan_code: u32 = @intCast((lparam >> 16) & 0xFF);
     const key = vkToInputKey(vk);
     const mods = currentMods();
+
+    // NOTE: we deliberately do NOT promote press→repeat for held keys.
+    // Ghostty's terminal encode path inserts text on every .press and
+    // ignores .repeat. Auto-repeat at the OS level already delivers
+    // WM_KEYDOWN on each repeat cycle; passing them all through as
+    // .press is what a terminal wants.
 
     // Compute utf8 from the key + layout. We do this only for press events
     // and only when Ctrl/Alt aren't held — those combos go to the engine as

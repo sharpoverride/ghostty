@@ -51,9 +51,35 @@ pub fn performAction(
     value: apprt.Action.Value(action),
 ) !bool {
     _ = self;
-    _ = target;
-    _ = value;
-    return false;
+    return switch (action) {
+        .set_title => blk: {
+            // .set_title is always per-surface — the engine never sends it
+            // with .app target. CoreSurface stores back-pointers, so we go
+            // CoreSurface → rt_surface (our apprt Surface) → window.
+            const core_surface = switch (target) {
+                .surface => |s| s,
+                .app => break :blk false,
+            };
+            const rt_surface = core_surface.rt_surface;
+            try rt_surface.window.setTitle(value.title);
+            break :blk true;
+        },
+
+        .ring_bell => blk: {
+            const core_surface = switch (target) {
+                .surface => |s| s,
+                .app => break :blk false,
+            };
+            core_surface.rt_surface.window.ringBell();
+            break :blk true;
+        },
+
+        // Everything else: engine gets graceful false. The features that
+        // matter for the win32 MVP (resize, focus, scroll, clipboard) live
+        // on the Surface and are wired through dedicated callbacks, not
+        // through performAction.
+        else => false,
+    };
 }
 
 pub fn performIpc(
