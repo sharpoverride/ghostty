@@ -220,6 +220,9 @@ extern "user32" fn ToUnicodeEx(
     wFlags: UINT,
     dwhkl: ?*anyopaque,
 ) callconv(.winapi) i32;
+extern "user32" fn MapVirtualKeyW(uCode: UINT, uMapType: UINT) callconv(.winapi) UINT;
+
+const MAPVK_VK_TO_CHAR: UINT = 2;
 
 extern "gdi32" fn CreateFontIndirectW(lplf: *const LOGFONTW) callconv(.winapi) HFONT;
 extern "gdi32" fn SelectObject(hdc: HDC, h: HGDIOBJ) callconv(.winapi) HGDIOBJ;
@@ -544,11 +547,26 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
         utf8 = utf8_buf[0..n];
     }
 
+    // Unshifted codepoint — what character this physical key produces with
+    // no modifiers. Critical for unicode-based keybindings: Ghostty's
+    // default font-size keybinds (Ctrl+=, Ctrl+-, Ctrl+0) match on
+    // .unicode = '=' / '-' / '0', not on .key = .equal. Without this the
+    // engine can't bridge from .key=.equal to the '=' codepoint trigger.
+    // MAPVK_VK_TO_CHAR returns the layout-aware char for the VK with no
+    // mods applied; dead-key bit (high bit) is ignored.
+    const mapped: UINT = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR);
+    const unshifted: u21 = blk: {
+        const ch: u32 = mapped & 0x7FFF_FFFF; // strip dead-key bit
+        if (ch == 0 or ch > 0x10_FFFF) break :blk 0;
+        break :blk @intCast(ch);
+    };
+
     const event: input.KeyEvent = .{
         .action = action,
         .key = key,
         .mods = mods,
         .utf8 = utf8,
+        .unshifted_codepoint = unshifted,
     };
     _ = surface.core_surface.keyCallback(event) catch |e| {
         log.warn("keyCallback err: vk=0x{X} key={} err={}", .{ vk, key, e });
