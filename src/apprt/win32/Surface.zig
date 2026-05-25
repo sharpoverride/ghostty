@@ -18,6 +18,7 @@ const CoreSurface = @import("../../Surface.zig");
 const ApprtApp = @import("App.zig");
 const Window = @import("Window.zig");
 const gl = @import("gl.zig");
+const clipboard = @import("clipboard.zig");
 
 const log = std.log.scoped(.win32_surface);
 
@@ -55,6 +56,16 @@ pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
 
     var config = try configpkg.Config.default(alloc);
     errdefer config.deinit();
+
+    // Windows-friendly defaults that the engine's default config doesn't
+    // already cover (the cross-platform default for these turns out to be
+    // a Linux/macOS sensibility):
+    //   * copy-on-select: auto-copy selection on drag end (matches
+    //     Windows Terminal, PuTTY, conhost).
+    //   * right-click-action: copy-or-paste, i.e. if there's a selection
+    //     copy it, otherwise paste — also WT behaviour.
+    config.@"copy-on-select" = .true;
+    config.@"right-click-action" = .@"copy-or-paste";
 
     self.* = .{
         .alloc = alloc,
@@ -143,14 +154,18 @@ pub fn getSize(self: *const Self) !apprt.SurfaceSize {
 }
 
 pub fn getCursorPos(self: *const Self) !apprt.CursorPos {
-    _ = self;
-    return .{ .x = 0, .y = 0 };
+    return .{
+        .x = @floatFromInt(self.window.last_mouse_x),
+        .y = @floatFromInt(self.window.last_mouse_y),
+    };
 }
 
 pub fn supportsClipboard(self: *const Self, clipboard_type: apprt.Clipboard) bool {
     _ = self;
-    _ = clipboard_type;
-    return false;
+    // Windows has a single system clipboard. Map .standard to it; .selection
+    // and .primary don't exist on Windows, so the engine won't ask for them
+    // anyway (returning false here keeps semantics honest).
+    return clipboard_type == .standard;
 }
 
 pub fn clipboardRequest(
@@ -158,10 +173,20 @@ pub fn clipboardRequest(
     clipboard_type: apprt.Clipboard,
     state: apprt.ClipboardRequest,
 ) !bool {
-    _ = self;
-    _ = clipboard_type;
-    _ = state;
-    return false;
+    if (clipboard_type != .standard) return false;
+
+    const text = (try clipboard.getText(self.alloc, self.window.hwnd)) orelse {
+        // Empty clipboard or text-format unavailable — deliver empty string
+        // so the paste path completes gracefully instead of stalling.
+        const empty = try self.alloc.allocSentinel(u8, 0, 0);
+        defer self.alloc.free(empty);
+        try self.core_surface.completeClipboardRequest(state, empty, false);
+        return true;
+    };
+    defer self.alloc.free(text);
+
+    try self.core_surface.completeClipboardRequest(state, text, false);
+    return true;
 }
 
 pub fn setClipboard(
@@ -170,10 +195,18 @@ pub fn setClipboard(
     contents: []const apprt.ClipboardContent,
     confirm: bool,
 ) !void {
-    _ = self;
-    _ = clipboard_type;
-    _ = contents;
     _ = confirm;
+    if (clipboard_type != .standard) return;
+
+    // Walk for the first text/plain entry. Ghostty may also pass image
+    // mime types in the future; until we support those, plain text is
+    // the only thing we round-trip.
+    for (contents) |content| {
+        if (std.mem.startsWith(u8, content.mime, "text/")) {
+            try clipboard.setText(content.data, self.window.hwnd);
+            return;
+        }
+    }
 }
 
 pub fn defaultTermioEnv(self: *Self) !std.process.EnvMap {

@@ -65,6 +65,18 @@ const WM_PAINT: UINT = 0x000F;
 const WM_CLOSE: UINT = 0x0010;
 const WM_QUIT: UINT = 0x0012;
 const WM_ERASEBKGND: UINT = 0x0014;
+const WM_SETFOCUS: UINT = 0x0007;
+const WM_KILLFOCUS: UINT = 0x0008;
+const WM_MOUSEMOVE: UINT = 0x0200;
+const WM_LBUTTONDOWN: UINT = 0x0201;
+const WM_LBUTTONUP: UINT = 0x0202;
+const WM_RBUTTONDOWN: UINT = 0x0204;
+const WM_RBUTTONUP: UINT = 0x0205;
+const WM_MBUTTONDOWN: UINT = 0x0207;
+const WM_MBUTTONUP: UINT = 0x0208;
+const WM_MOUSEWHEEL: UINT = 0x020A;
+const WM_MOUSEHWHEEL: UINT = 0x020E;
+const WHEEL_DELTA: f64 = 120.0;
 const WM_KEYDOWN: UINT = 0x0100;
 const WM_KEYUP: UINT = 0x0101;
 const WM_CHAR: UINT = 0x0102;
@@ -221,6 +233,8 @@ extern "user32" fn ToUnicodeEx(
     dwhkl: ?*anyopaque,
 ) callconv(.winapi) i32;
 extern "user32" fn MapVirtualKeyW(uCode: UINT, uMapType: UINT) callconv(.winapi) UINT;
+extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 
 const MAPVK_VK_TO_CHAR: UINT = 2;
 
@@ -251,6 +265,11 @@ char_h: i32,
 /// the Window is fully constructed. May be null during WM_CREATE / first
 /// WM_SIZE — those callbacks must no-op when surface is null.
 surface: ?*Surface = null,
+/// Last cursor position seen via WM_MOUSEMOVE (client coords). Cached so
+/// `Surface.getCursorPos()` can return a sane value when the engine queries
+/// it outside of a move event.
+last_mouse_x: i32 = 0,
+last_mouse_y: i32 = 0,
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWin32");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -404,6 +423,17 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         // ToUnicodeEx providing the utf8. Letting it through here would
         // double-send every character to the pty.
         WM_CHAR, WM_SYSCHAR => return 0,
+        WM_SETFOCUS => forwardFocus(hwnd, true),
+        WM_KILLFOCUS => forwardFocus(hwnd, false),
+        WM_MOUSEMOVE => forwardMouseMove(hwnd, lparam),
+        WM_LBUTTONDOWN => forwardMouseButton(hwnd, .left, .press, true),
+        WM_LBUTTONUP => forwardMouseButton(hwnd, .left, .release, false),
+        WM_RBUTTONDOWN => forwardMouseButton(hwnd, .right, .press, false),
+        WM_RBUTTONUP => forwardMouseButton(hwnd, .right, .release, false),
+        WM_MBUTTONDOWN => forwardMouseButton(hwnd, .middle, .press, false),
+        WM_MBUTTONUP => forwardMouseButton(hwnd, .middle, .release, false),
+        WM_MOUSEWHEEL => forwardWheel(hwnd, wparam, .vertical),
+        WM_MOUSEHWHEEL => forwardWheel(hwnd, wparam, .horizontal),
         WM_SIZE => forwardSize(hwnd, lparam),
         WM_CLOSE, WM_DESTROY => {
             PostQuitMessage(0);
@@ -414,6 +444,81 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
+fn forwardFocus(hwnd: HWND, focused: bool) void {
+    const self = recoverSelf(hwnd) orelse return;
+    const surface = self.surface orelse return;
+    surface.core_surface.focusCallback(focused) catch |e| {
+        log.warn("focusCallback err: {}", .{e});
+    };
+}
+
+fn forwardWheel(hwnd: HWND, wparam: WPARAM, axis: enum { vertical, horizontal }) void {
+    const self = recoverSelf(hwnd) orelse return;
+    const surface = self.surface orelse return;
+    // Delta lives in the high word as a signed 16-bit value. WHEEL_DELTA
+    // (120) is one notch — Ghostty expects yoff in notches with positive
+    // meaning "scroll up" / lines moving towards the user. Windows uses
+    // the same sign convention (positive = wheel forward = up).
+    const raw_delta: u16 = @intCast((wparam >> 16) & 0xFFFF);
+    const delta_i16: i16 = @bitCast(raw_delta);
+    const notches: f64 = @as(f64, @floatFromInt(delta_i16)) / WHEEL_DELTA;
+    const xoff: f64 = if (axis == .horizontal) notches else 0.0;
+    const yoff: f64 = if (axis == .vertical) notches else 0.0;
+    surface.core_surface.scrollCallback(xoff, yoff, .{}) catch |e| {
+        log.warn("scrollCallback err: {}", .{e});
+    };
+}
+
+/// Pull signed 16-bit x,y out of an lparam carrying client coordinates.
+fn unpackXY(lparam: LPARAM) struct { x: i32, y: i32 } {
+    const x_u16: u16 = @intCast(lparam & 0xFFFF);
+    const y_u16: u16 = @intCast((lparam >> 16) & 0xFFFF);
+    return .{
+        .x = @as(i32, @as(i16, @bitCast(x_u16))),
+        .y = @as(i32, @as(i16, @bitCast(y_u16))),
+    };
+}
+
+fn forwardMouseMove(hwnd: HWND, lparam: LPARAM) void {
+    const self = recoverSelf(hwnd) orelse return;
+    const surface = self.surface orelse return;
+    const xy = unpackXY(lparam);
+    self.last_mouse_x = xy.x;
+    self.last_mouse_y = xy.y;
+    surface.core_surface.cursorPosCallback(.{
+        .x = @floatFromInt(xy.x),
+        .y = @floatFromInt(xy.y),
+    }, null) catch |e| {
+        log.warn("cursorPosCallback err: {}", .{e});
+    };
+}
+
+fn forwardMouseButton(
+    hwnd: HWND,
+    button: input.MouseButton,
+    state: input.MouseButtonState,
+    capture: bool,
+) void {
+    const self = recoverSelf(hwnd) orelse return;
+    const surface = self.surface orelse return;
+
+    // SetCapture on left-button-down keeps WM_MOUSEMOVE flowing even when
+    // the cursor leaves the client area — necessary for drag-selection that
+    // ends past the window edge. The matching ReleaseCapture happens
+    // automatically on WM_LBUTTONUP (Win32 contract), but call it
+    // explicitly to be safe.
+    if (capture) {
+        _ = SetCapture(hwnd);
+    } else if (state == .release and button == .left) {
+        _ = ReleaseCapture();
+    }
+
+    const mods = currentMods();
+    _ = surface.core_surface.mouseButtonCallback(state, button, mods) catch |e| {
+        log.warn("mouseButtonCallback err: {}", .{e});
+    };
+}
+
 fn recoverSelf(hwnd: HWND) ?*Self {
     const p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (p == 0) return null;
@@ -421,11 +526,30 @@ fn recoverSelf(hwnd: HWND) ?*Self {
 }
 
 fn currentMods() input.Mods {
-    return .{
-        .shift = (GetKeyState(0x10) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0, // VK_SHIFT
-        .ctrl = (GetKeyState(0x11) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0, // VK_CONTROL
-        .alt = (GetKeyState(0x12) & @as(i16, @bitCast(@as(u16, 0x8000)))) != 0, // VK_MENU
+    const down: i16 = @bitCast(@as(u16, 0x8000));
+    var mods: input.Mods = .{
+        .shift = (GetKeyState(0x10) & down) != 0, // VK_SHIFT
+        .ctrl = (GetKeyState(0x11) & down) != 0, // VK_CONTROL
+        .alt = (GetKeyState(0x12) & down) != 0, // VK_MENU
     };
+
+    // AltGr detection: on EU layouts (Romanian, German, French, etc.) the
+    // AltGr key fires WM_KEYDOWN(VK_LCONTROL) immediately followed by
+    // WM_KEYDOWN(VK_RMENU) — Windows surfaces it as Ctrl+Alt. We want
+    // AltGr+key to produce the layout's special char (e.g. AltGr+2 = @
+    // on Romanian), not to be treated as Ctrl+Alt+key which would skip
+    // ToUnicodeEx and break unicode binding lookups. Heuristic: if both
+    // Ctrl and Alt are down AND the right Alt is the one down, this is
+    // AltGr — strip ctrl + alt so ToUnicodeEx runs.
+    if (mods.ctrl and mods.alt) {
+        const ralt_down = (GetKeyState(0xA5) & down) != 0; // VK_RMENU
+        if (ralt_down) {
+            mods.ctrl = false;
+            mods.alt = false;
+        }
+    }
+
+    return mods;
 }
 
 /// Map a Windows virtual-key code to an input.Key. Returns `.unidentified`
