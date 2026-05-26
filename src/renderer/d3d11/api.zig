@@ -29,18 +29,111 @@ pub const GUID = windows.GUID;
 // the convenience wrappers defined per-interface.
 // ---------------------------------------------------------------------------
 
-pub const ID3D11Buffer = opaque {};
-pub const ID3D11Texture2D = opaque {};
-pub const ID3D11ShaderResourceView = opaque {};
-pub const ID3D11SamplerState = opaque {};
-pub const ID3D11VertexShader = opaque {};
-pub const ID3D11PixelShader = opaque {};
-pub const ID3D11InputLayout = opaque {};
+// Each of the COM interfaces below is an extern struct with a leading
+// vtable pointer. Only IUnknown::Release is typed — that's all our code
+// touches; the real vtables have many more methods at later slots which
+// we leave implicit.
+
+pub const ID3D11Buffer = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11Buffer) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11Buffer) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11Texture2D = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11Texture2D) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11Texture2D) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11ShaderResourceView = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11ShaderResourceView) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11ShaderResourceView) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11SamplerState = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11SamplerState) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11SamplerState) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11VertexShader = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11VertexShader) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11VertexShader) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11PixelShader = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11PixelShader) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11PixelShader) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11InputLayout = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11InputLayout) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11InputLayout) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
 pub const ID3D11BlendState = opaque {};
 pub const ID3D11RasterizerState = opaque {};
 pub const ID3D11DepthStencilState = opaque {};
-pub const ID3D11Resource = opaque {};
 pub const IDXGIAdapter = opaque {};
+
+pub const ID3D11Resource = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11Resource) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11Resource) u32 {
+        return self.vtable.Release(self);
+    }
+};
 
 /// IDXGIFactory2: only CreateSwapChainForHwnd is typed; everything before
 /// it is opaque padding. Method ordering follows dxgi1_2.h.
@@ -132,9 +225,32 @@ pub const IDXGISwapChain1 = extern struct {
     }
 };
 
+pub const D3D11_SUBRESOURCE_DATA = extern struct {
+    pSysMem: *const anyopaque,
+    SysMemPitch: UINT = 0,
+    SysMemSlicePitch: UINT = 0,
+};
+
+pub const D3D11_INPUT_CLASSIFICATION = enum(UINT) {
+    PER_VERTEX_DATA = 0,
+    PER_INSTANCE_DATA = 1,
+};
+
+pub const D3D11_INPUT_ELEMENT_DESC = extern struct {
+    SemanticName: [*:0]const u8,
+    SemanticIndex: UINT,
+    Format: DXGI_FORMAT,
+    InputSlot: UINT,
+    AlignedByteOffset: UINT,
+    InputSlotClass: D3D11_INPUT_CLASSIFICATION,
+    InstanceDataStepRate: UINT,
+};
+
 pub const ID3D11Device = extern struct {
     vtable: *const VTable,
 
+    /// Method ordering follows d3d11.h's vtable layout exactly. Each entry
+    /// must stay at its real index; unused slots stay `*const anyopaque`.
     pub const VTable = extern struct {
         // IUnknown
         QueryInterface: *const fn (
@@ -144,8 +260,13 @@ pub const ID3D11Device = extern struct {
         ) callconv(.winapi) HRESULT,
         AddRef: *const anyopaque,
         Release: *const fn (self: *ID3D11Device) callconv(.winapi) u32,
-        // ID3D11Device (27+ methods; we type only what we call)
-        CreateBuffer: *const anyopaque,
+        // ID3D11Device — slot 4..
+        CreateBuffer: *const fn (
+            self: *ID3D11Device,
+            pDesc: *const D3D11_BUFFER_DESC,
+            pInitialData: ?*const D3D11_SUBRESOURCE_DATA,
+            ppBuffer: *?*ID3D11Buffer,
+        ) callconv(.winapi) HRESULT,
         CreateTexture1D: *const anyopaque,
         CreateTexture2D: *const anyopaque,
         CreateTexture3D: *const anyopaque,
@@ -157,7 +278,32 @@ pub const ID3D11Device = extern struct {
             pDesc: ?*const anyopaque,
             ppRTView: *?*ID3D11RenderTargetView,
         ) callconv(.winapi) HRESULT,
-        // ... rest opaque
+        CreateDepthStencilView: *const anyopaque,
+        CreateInputLayout: *const fn (
+            self: *ID3D11Device,
+            pInputElementDescs: [*]const D3D11_INPUT_ELEMENT_DESC,
+            NumElements: UINT,
+            pShaderBytecodeWithInputSignature: *const anyopaque,
+            BytecodeLength: usize,
+            ppInputLayout: *?*ID3D11InputLayout,
+        ) callconv(.winapi) HRESULT,
+        CreateVertexShader: *const fn (
+            self: *ID3D11Device,
+            pShaderBytecode: *const anyopaque,
+            BytecodeLength: usize,
+            pClassLinkage: ?*anyopaque,
+            ppVertexShader: *?*ID3D11VertexShader,
+        ) callconv(.winapi) HRESULT,
+        CreateGeometryShader: *const anyopaque,
+        CreateGeometryShaderWithStreamOutput: *const anyopaque,
+        CreatePixelShader: *const fn (
+            self: *ID3D11Device,
+            pShaderBytecode: *const anyopaque,
+            BytecodeLength: usize,
+            pClassLinkage: ?*anyopaque,
+            ppPixelShader: *?*ID3D11PixelShader,
+        ) callconv(.winapi) HRESULT,
+        // ... rest opaque for now
     };
 
     pub fn release(self: *ID3D11Device) u32 {
@@ -181,22 +327,49 @@ pub const ID3D11DeviceContext = extern struct {
         // ID3D11DeviceContext
         VSSetConstantBuffers: *const anyopaque,
         PSSetShaderResources: *const anyopaque,
-        PSSetShader: *const anyopaque,
+        PSSetShader: *const fn (
+            self: *ID3D11DeviceContext,
+            pPixelShader: ?*ID3D11PixelShader,
+            ppClassInstances: ?[*]const ?*anyopaque,
+            NumClassInstances: UINT,
+        ) callconv(.winapi) void,
         PSSetSamplers: *const anyopaque,
-        VSSetShader: *const anyopaque,
+        VSSetShader: *const fn (
+            self: *ID3D11DeviceContext,
+            pVertexShader: ?*ID3D11VertexShader,
+            ppClassInstances: ?[*]const ?*anyopaque,
+            NumClassInstances: UINT,
+        ) callconv(.winapi) void,
         DrawIndexed: *const anyopaque,
-        Draw: *const anyopaque,
+        Draw: *const fn (
+            self: *ID3D11DeviceContext,
+            VertexCount: UINT,
+            StartVertexLocation: UINT,
+        ) callconv(.winapi) void,
         Map: *const anyopaque,
         Unmap: *const anyopaque,
         PSSetConstantBuffers: *const anyopaque,
-        IASetInputLayout: *const anyopaque,
-        IASetVertexBuffers: *const anyopaque,
+        IASetInputLayout: *const fn (
+            self: *ID3D11DeviceContext,
+            pInputLayout: ?*ID3D11InputLayout,
+        ) callconv(.winapi) void,
+        IASetVertexBuffers: *const fn (
+            self: *ID3D11DeviceContext,
+            StartSlot: UINT,
+            NumBuffers: UINT,
+            ppVertexBuffers: [*]const *ID3D11Buffer,
+            pStrides: [*]const UINT,
+            pOffsets: [*]const UINT,
+        ) callconv(.winapi) void,
         IASetIndexBuffer: *const anyopaque,
         DrawIndexedInstanced: *const anyopaque,
         DrawInstanced: *const anyopaque,
         GSSetConstantBuffers: *const anyopaque,
         GSSetShader: *const anyopaque,
-        IASetPrimitiveTopology: *const anyopaque,
+        IASetPrimitiveTopology: *const fn (
+            self: *ID3D11DeviceContext,
+            Topology: D3D11_PRIMITIVE_TOPOLOGY,
+        ) callconv(.winapi) void,
         VSSetShaderResources: *const anyopaque,
         VSSetSamplers: *const anyopaque,
         Begin: *const anyopaque,
@@ -259,7 +432,29 @@ pub const ID3D11RenderTargetView = extern struct {
     }
 };
 
-pub const ID3DBlob = opaque {};
+pub const ID3DBlob = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3DBlob) callconv(.winapi) u32,
+        GetBufferPointer: *const fn (self: *ID3DBlob) callconv(.winapi) *anyopaque,
+        GetBufferSize: *const fn (self: *ID3DBlob) callconv(.winapi) usize,
+    };
+
+    pub fn release(self: *ID3DBlob) u32 {
+        return self.vtable.Release(self);
+    }
+
+    pub fn bufferPointer(self: *ID3DBlob) *anyopaque {
+        return self.vtable.GetBufferPointer(self);
+    }
+
+    pub fn bufferSize(self: *ID3DBlob) usize {
+        return self.vtable.GetBufferSize(self);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Descriptors and enums.
@@ -420,6 +615,16 @@ pub const D3D11_CREATE_DEVICE_FLAG = packed struct(UINT) {
     single_threaded: bool = false,
     debug: bool = false,
     _pad: u30 = 0,
+};
+
+pub const D3D11_PRIMITIVE_TOPOLOGY = enum(UINT) {
+    UNDEFINED = 0,
+    POINTLIST = 1,
+    LINELIST = 2,
+    LINESTRIP = 3,
+    TRIANGLELIST = 4,
+    TRIANGLESTRIP = 5,
+    _,
 };
 
 // ---------------------------------------------------------------------------
