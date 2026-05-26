@@ -1,25 +1,44 @@
 //! Graphics API wrapper for Direct3D 11.
 //!
-//! STATUS: structural skeleton. All sub-modules (`d3d11/api.zig`,
-//! `d3d11/{Target,Frame,RenderPass,Pipeline,Sampler,Texture,buffer,shaders}.zig`)
-//! exist and pass `zig ast-check`, but their method bodies are stubs that
-//! return `error.D3D11NotYetImplemented`. To make `GenericRenderer(D3D11)`
-//! actually compile, two non-trivial pieces still need to land:
+//! STATUS as of 2026-05-26: device + swap chain proof-of-life landed
+//! in `apprt/win32/d3d11.zig` (clear-to-blue + present at startup,
+//! validated on hardware feature level 11.1, BGRA8 flip-discard swap
+//! chain). The COM bring-up is solid — d3d11/dxgi/d3dcompiler link
+//! correctly, IDXGIFactory2/IDXGISwapChain1/ID3D11Device/...Context/
+//! ID3D11RenderTargetView vtables match the real interface layouts.
 //!
-//!   1. `d3d11/shaders.zig` must expose real `Uniforms`, `CellText`,
-//!      `Image`, `BgImage` extern structs with the exact memory layout HLSL
-//!      shaders will consume. Cleanest path: copy these from
-//!      `metal/shaders.zig` verbatim — they're shader-data layouts, not
-//!      backend-specific.
-//!   2. This file must grow the ~22 GraphicsAPI methods generic.zig calls:
-//!      surfaceInit, finalizeSurfaceInit, threadEnter/Exit, loopEnter/Exit,
-//!      displayRealized/Unrealized, drawFrameStart/End, surfaceSize,
-//!      presentLastTarget, beginFrame, initTarget, initAtlasTexture,
-//!      initShaders, plus the *BufferOptions / samplerOptions /
-//!      textureOptions accessor families.
+//! What this file still needs before `GenericRenderer(D3D11)` can
+//! replace `GenericRenderer(OpenGL)` in `renderer.zig`:
 //!
-//! Until those land, `src/renderer.zig` keeps `.d3d11` mapped to
-//! `GenericRenderer(OpenGL)` as a stand-in.
+//!   1. `d3d11/shaders.zig` extern structs (Uniforms, CellText, Image,
+//!      BgImage) — copy verbatim from `metal/shaders.zig`, they're
+//!      shader-data layouts not backend-specific.
+//!   2. The ~22 GraphicsAPI methods generic.zig calls:
+//!        surfaceInit, finalizeSurfaceInit, threadEnter/Exit,
+//!        loopEnter/Exit, displayRealized/Unrealized,
+//!        drawFrameStart/End, surfaceSize, presentLastTarget,
+//!        beginFrame, initTarget, initAtlasTexture, initShaders,
+//!        plus the *BufferOptions / samplerOptions / textureOptions
+//!        accessor families.
+//!   3. HLSL shaders ported from `shaders/glsl/*.glsl` to
+//!      `shaders/hlsl/*.hlsl`. Five shaders: bg_color, cell_bg,
+//!      cell_text, image, bg_image. Account for HLSL ↔ GLSL deltas:
+//!      row-major vs column-major matrices, NDC z range, sampler
+//!      binding model.
+//!   4. Real Buffer/Texture/Sampler implementations in
+//!      `d3d11/{buffer,Texture,Sampler}.zig`. Each wraps the
+//!      corresponding D3D11 object.
+//!   5. Pipeline = vertex shader + pixel shader + input layout + blend
+//!      state + rasterizer state, one per cell type. Built once in
+//!      initShaders.
+//!   6. Target = back-buffer-backed Texture2D + RTV (already prototyped
+//!      in `apprt/win32/d3d11.zig::Context.createBackBufferRtv`).
+//!   7. RenderPass = OMSetRenderTargets + ClearRenderTargetView +
+//!      RSSetViewports prologue, draw work, no explicit epilogue.
+//!
+//! Estimated effort: 2-4 focused sessions on top of what's here.
+//! `renderer.zig` keeps `.d3d11` falling back to `GenericRenderer(OpenGL)`
+//! until all the above lands.
 pub const D3D11 = @This();
 
 const std = @import("std");

@@ -18,6 +18,7 @@ const CoreSurface = @import("../../Surface.zig");
 const ApprtApp = @import("App.zig");
 const Window = @import("Window.zig");
 const gl = @import("gl.zig");
+const d3d11 = @import("d3d11.zig");
 const clipboard = @import("clipboard.zig");
 
 const log = std.log.scoped(.win32_surface);
@@ -44,6 +45,26 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
 
     const window = try Window.create(alloc, @ptrCast(parent_hwnd));
     errdefer window.deinit();
+
+    // D3D11 proof-of-life: build the COM stack, clear-to-blue + present
+    // once, then tear down. Verifies the D3D11/DXGI bring-up works on
+    // this HWND before WGL takes the HDC. Phase 2 will keep this
+    // context alive and route the engine through it instead of WGL.
+    //
+    // NOTE: the SetPixelFormat that WGL does next would conflict with
+    // D3D11's claim on the HDC if both stayed alive — we destroy this
+    // D3D11 context immediately, releasing the swap chain, before WGL
+    // takes over. The visible blue flash is the validation signal.
+    if (d3d11.Context.init(window.hwnd)) |d3d_ctx| {
+        var ctx_mut = d3d_ctx;
+        // Bright blue so we can see it against any background.
+        ctx_mut.clearAndPresent(.{ 0.2, 0.4, 1.0, 1.0 });
+        std.Thread.sleep(150 * std.time.ns_per_ms); // hold so it's visible
+        ctx_mut.deinit();
+        log.info("D3D11 proof-of-life: clear-to-blue presented, tearing down", .{});
+    } else |e| {
+        log.warn("D3D11 proof-of-life FAILED: {}", .{e});
+    }
 
     // WGL context: must succeed for the renderer thread to attach. If we
     // can't get a 4.3 core context we abort surface creation — there's no

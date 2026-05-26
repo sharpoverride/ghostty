@@ -20,14 +20,17 @@ pub const BOOL = windows.BOOL;
 pub const GUID = windows.GUID;
 
 // ---------------------------------------------------------------------------
-// COM interfaces (opaque placeholders; vtables come when call sites land).
+// COM interfaces. Each is an extern struct with a leading vtable pointer.
+// The vtables match the C ABI laid out by d3d11.h / dxgi1_2.h — only the
+// methods our renderer actually calls are typed; everything before them
+// is `*const anyopaque` padding so offsets stay correct.
+//
+// To call: `obj.vt().Method.?(obj, args...)` for each call site, or use
+// the convenience wrappers defined per-interface.
 // ---------------------------------------------------------------------------
 
-pub const ID3D11Device = opaque {};
-pub const ID3D11DeviceContext = opaque {};
 pub const ID3D11Buffer = opaque {};
 pub const ID3D11Texture2D = opaque {};
-pub const ID3D11RenderTargetView = opaque {};
 pub const ID3D11ShaderResourceView = opaque {};
 pub const ID3D11SamplerState = opaque {};
 pub const ID3D11VertexShader = opaque {};
@@ -36,11 +39,227 @@ pub const ID3D11InputLayout = opaque {};
 pub const ID3D11BlendState = opaque {};
 pub const ID3D11RasterizerState = opaque {};
 pub const ID3D11DepthStencilState = opaque {};
-pub const ID3DBlob = opaque {};
-
-pub const IDXGIFactory2 = opaque {};
-pub const IDXGISwapChain1 = opaque {};
+pub const ID3D11Resource = opaque {};
 pub const IDXGIAdapter = opaque {};
+
+/// IDXGIFactory2: only CreateSwapChainForHwnd is typed; everything before
+/// it is opaque padding. Method ordering follows dxgi1_2.h.
+pub const IDXGIFactory2 = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        // IUnknown (3)
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *IDXGIFactory2) callconv(.winapi) u32,
+        // IDXGIObject (4)
+        SetPrivateData: *const anyopaque,
+        SetPrivateDataInterface: *const anyopaque,
+        GetPrivateData: *const anyopaque,
+        GetParent: *const anyopaque,
+        // IDXGIFactory (5)
+        EnumAdapters: *const anyopaque,
+        MakeWindowAssociation: *const anyopaque,
+        GetWindowAssociation: *const anyopaque,
+        CreateSwapChain: *const anyopaque,
+        CreateSoftwareAdapter: *const anyopaque,
+        // IDXGIFactory1 (2)
+        EnumAdapters1: *const anyopaque,
+        IsCurrent: *const anyopaque,
+        // IDXGIFactory2 (3 we need)
+        IsWindowedStereoEnabled: *const anyopaque,
+        CreateSwapChainForHwnd: *const fn (
+            self: *IDXGIFactory2,
+            pDevice: *anyopaque,
+            hWnd: HWND,
+            pDesc: *const DXGI_SWAP_CHAIN_DESC1,
+            pFullscreenDesc: ?*const anyopaque,
+            pRestrictToOutput: ?*anyopaque,
+            ppSwapChain: *?*IDXGISwapChain1,
+        ) callconv(.winapi) HRESULT,
+        CreateSwapChainForCoreWindow: *const anyopaque,
+        // ... more methods follow that we don't need
+    };
+
+    pub fn release(self: *IDXGIFactory2) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const IDXGISwapChain1 = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        // IUnknown
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *IDXGISwapChain1) callconv(.winapi) u32,
+        // IDXGIObject
+        SetPrivateData: *const anyopaque,
+        SetPrivateDataInterface: *const anyopaque,
+        GetPrivateData: *const anyopaque,
+        GetParent: *const anyopaque,
+        // IDXGIDeviceSubObject
+        GetDevice: *const anyopaque,
+        // IDXGISwapChain
+        Present: *const fn (
+            self: *IDXGISwapChain1,
+            SyncInterval: UINT,
+            Flags: UINT,
+        ) callconv(.winapi) HRESULT,
+        GetBuffer: *const fn (
+            self: *IDXGISwapChain1,
+            Buffer: UINT,
+            riid: *const GUID,
+            ppSurface: *?*anyopaque,
+        ) callconv(.winapi) HRESULT,
+        SetFullscreenState: *const anyopaque,
+        GetFullscreenState: *const anyopaque,
+        GetDesc: *const anyopaque,
+        ResizeBuffers: *const fn (
+            self: *IDXGISwapChain1,
+            BufferCount: UINT,
+            Width: UINT,
+            Height: UINT,
+            NewFormat: DXGI_FORMAT,
+            SwapChainFlags: UINT,
+        ) callconv(.winapi) HRESULT,
+        // ... more methods we don't need
+    };
+
+    pub fn release(self: *IDXGISwapChain1) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11Device = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        // IUnknown
+        QueryInterface: *const fn (
+            self: *ID3D11Device,
+            riid: *const GUID,
+            ppvObject: *?*anyopaque,
+        ) callconv(.winapi) HRESULT,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11Device) callconv(.winapi) u32,
+        // ID3D11Device (27+ methods; we type only what we call)
+        CreateBuffer: *const anyopaque,
+        CreateTexture1D: *const anyopaque,
+        CreateTexture2D: *const anyopaque,
+        CreateTexture3D: *const anyopaque,
+        CreateShaderResourceView: *const anyopaque,
+        CreateUnorderedAccessView: *const anyopaque,
+        CreateRenderTargetView: *const fn (
+            self: *ID3D11Device,
+            pResource: *ID3D11Resource,
+            pDesc: ?*const anyopaque,
+            ppRTView: *?*ID3D11RenderTargetView,
+        ) callconv(.winapi) HRESULT,
+        // ... rest opaque
+    };
+
+    pub fn release(self: *ID3D11Device) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11DeviceContext = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        // IUnknown
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11DeviceContext) callconv(.winapi) u32,
+        // ID3D11DeviceChild
+        GetDevice: *const anyopaque,
+        GetPrivateData: *const anyopaque,
+        SetPrivateData: *const anyopaque,
+        SetPrivateDataInterface: *const anyopaque,
+        // ID3D11DeviceContext
+        VSSetConstantBuffers: *const anyopaque,
+        PSSetShaderResources: *const anyopaque,
+        PSSetShader: *const anyopaque,
+        PSSetSamplers: *const anyopaque,
+        VSSetShader: *const anyopaque,
+        DrawIndexed: *const anyopaque,
+        Draw: *const anyopaque,
+        Map: *const anyopaque,
+        Unmap: *const anyopaque,
+        PSSetConstantBuffers: *const anyopaque,
+        IASetInputLayout: *const anyopaque,
+        IASetVertexBuffers: *const anyopaque,
+        IASetIndexBuffer: *const anyopaque,
+        DrawIndexedInstanced: *const anyopaque,
+        DrawInstanced: *const anyopaque,
+        GSSetConstantBuffers: *const anyopaque,
+        GSSetShader: *const anyopaque,
+        IASetPrimitiveTopology: *const anyopaque,
+        VSSetShaderResources: *const anyopaque,
+        VSSetSamplers: *const anyopaque,
+        Begin: *const anyopaque,
+        End: *const anyopaque,
+        GetData: *const anyopaque,
+        SetPredication: *const anyopaque,
+        GSSetShaderResources: *const anyopaque,
+        GSSetSamplers: *const anyopaque,
+        OMSetRenderTargets: *const fn (
+            self: *ID3D11DeviceContext,
+            NumViews: UINT,
+            ppRenderTargetViews: ?[*]const *ID3D11RenderTargetView,
+            pDepthStencilView: ?*anyopaque,
+        ) callconv(.winapi) void,
+        OMSetRenderTargetsAndUnorderedAccessViews: *const anyopaque,
+        OMSetBlendState: *const anyopaque,
+        OMSetDepthStencilState: *const anyopaque,
+        SOSetTargets: *const anyopaque,
+        DrawAuto: *const anyopaque,
+        DrawIndexedInstancedIndirect: *const anyopaque,
+        DrawInstancedIndirect: *const anyopaque,
+        Dispatch: *const anyopaque,
+        DispatchIndirect: *const anyopaque,
+        RSSetState: *const anyopaque,
+        RSSetViewports: *const fn (
+            self: *ID3D11DeviceContext,
+            NumViewports: UINT,
+            pViewports: [*]const D3D11_VIEWPORT,
+        ) callconv(.winapi) void,
+        RSSetScissorRects: *const anyopaque,
+        CopySubresourceRegion: *const anyopaque,
+        CopyResource: *const anyopaque,
+        UpdateSubresource: *const anyopaque,
+        CopyStructureCount: *const anyopaque,
+        ClearRenderTargetView: *const fn (
+            self: *ID3D11DeviceContext,
+            pRenderTargetView: *ID3D11RenderTargetView,
+            ColorRGBA: *const [4]f32,
+        ) callconv(.winapi) void,
+        // ... rest opaque
+    };
+
+    pub fn release(self: *ID3D11DeviceContext) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11RenderTargetView = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11RenderTargetView) callconv(.winapi) u32,
+        // ... rest opaque
+    };
+
+    pub fn release(self: *ID3D11RenderTargetView) u32 {
+        return self.vtable.Release(self);
+    }
+};
+
+pub const ID3DBlob = opaque {};
 
 // ---------------------------------------------------------------------------
 // Descriptors and enums.
@@ -142,6 +361,67 @@ pub const D3D11_TEXTURE_ADDRESS_MODE = enum(UINT) {
     MIRROR_ONCE = 5,
 };
 
+pub const DXGI_USAGE = packed struct(UINT) {
+    _pad0: u4 = 0,
+    shader_input: bool = false,
+    render_target_output: bool = false,
+    back_buffer: bool = false,
+    shared: bool = false,
+    read_only: bool = false,
+    discard_on_present: bool = false,
+    unordered_access: bool = false,
+    _pad11: u21 = 0,
+};
+
+pub const DXGI_SCALING = enum(UINT) {
+    STRETCH = 0,
+    NONE = 1,
+    ASPECT_RATIO_STRETCH = 2,
+};
+
+pub const DXGI_SWAP_EFFECT = enum(UINT) {
+    DISCARD = 0,
+    SEQUENTIAL = 1,
+    FLIP_SEQUENTIAL = 3,
+    FLIP_DISCARD = 4,
+};
+
+pub const DXGI_ALPHA_MODE = enum(UINT) {
+    UNSPECIFIED = 0,
+    PREMULTIPLIED = 1,
+    STRAIGHT = 2,
+    IGNORE = 3,
+};
+
+pub const DXGI_SWAP_CHAIN_DESC1 = extern struct {
+    Width: UINT,
+    Height: UINT,
+    Format: DXGI_FORMAT,
+    Stereo: BOOL,
+    SampleDesc: DXGI_SAMPLE_DESC,
+    BufferUsage: DXGI_USAGE,
+    BufferCount: UINT,
+    Scaling: DXGI_SCALING,
+    SwapEffect: DXGI_SWAP_EFFECT,
+    AlphaMode: DXGI_ALPHA_MODE,
+    Flags: UINT,
+};
+
+pub const D3D11_VIEWPORT = extern struct {
+    TopLeftX: f32,
+    TopLeftY: f32,
+    Width: f32,
+    Height: f32,
+    MinDepth: f32,
+    MaxDepth: f32,
+};
+
+pub const D3D11_CREATE_DEVICE_FLAG = packed struct(UINT) {
+    single_threaded: bool = false,
+    debug: bool = false,
+    _pad: u30 = 0,
+};
+
 // ---------------------------------------------------------------------------
 // Global entry points. These are real exports of d3d11.dll / dxgi.dll /
 // d3dcompiler_47.dll — they exist whether or not the rest of the renderer
@@ -189,3 +469,26 @@ pub const IID_IDXGIFactory2: GUID = .{
     .Data3 = 0x4c48,
     .Data4 = .{ 0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0 },
 };
+
+pub const IID_ID3D11Texture2D: GUID = .{
+    .Data1 = 0x6f15aaf2,
+    .Data2 = 0xd208,
+    .Data3 = 0x4e89,
+    .Data4 = .{ 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c },
+};
+
+pub const IID_IDXGIDevice: GUID = .{
+    .Data1 = 0x54ec77fa,
+    .Data2 = 0x1377,
+    .Data3 = 0x44e6,
+    .Data4 = .{ 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c },
+};
+
+/// Helper for HRESULT success check.
+pub inline fn succeeded(hr: HRESULT) bool {
+    return hr >= 0;
+}
+
+pub inline fn failed(hr: HRESULT) bool {
+    return hr < 0;
+}
