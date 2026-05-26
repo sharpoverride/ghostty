@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const math = @import("../../math.zig");
 const d3d = @import("api.zig");
 const Pipeline = @import("Pipeline.zig");
 
@@ -66,11 +67,119 @@ pub const PipelineCollection = struct {
     bg_image: Pipeline,
 };
 
-// Placeholder data structs. Real layouts will be ported from metal/shaders.zig
-// when the d3d11 backend is switched in. Each must be `extern struct` with
-// alignment matching the HLSL cbuffer / VS input layout exactly.
-pub const Uniforms = extern struct {};
-pub const CellText = extern struct {};
+// Shader-data layouts ported from `metal/shaders.zig`. These are not
+// backend-specific — they define the memory layout the HLSL shaders
+// will consume via cbuffer + vertex input slots. Alignment annotations
+// match Metal's MSL reference; HLSL will see the same byte layout.
+
+pub const Uniforms = extern struct {
+    /// World→NDC projection matrix (computed from screen + padding).
+    projection_matrix: math.Mat align(16),
+
+    /// Render target size in pixels.
+    screen_size: [2]f32 align(8),
+
+    /// Single cell size in pixels, unscaled.
+    cell_size: [2]f32 align(8),
+
+    /// Grid extent in (columns, rows).
+    grid_size: [2]u16 align(4),
+
+    /// Padding around the grid, in pixels: top, right, bottom, left.
+    grid_padding: [4]f32 align(16),
+
+    /// Which directions to extend cell colors into the padding band.
+    padding_extend: PaddingExtend align(1),
+
+    /// Minimum WCAG 2.0 contrast ratio for text.
+    min_contrast: f32 align(4),
+
+    /// Cursor cell position + color.
+    cursor_pos: [2]u16 align(4),
+    cursor_color: [4]u8 align(4),
+
+    /// Surface-wide background color.
+    bg_color: [4]u8 align(4),
+
+    bools: extern struct {
+        cursor_wide: bool align(1),
+        use_display_p3: bool align(1),
+        use_linear_blending: bool align(1),
+        use_linear_correction: bool align(1) = false,
+    },
+
+    pub const PaddingExtend = packed struct(u8) {
+        left: bool = false,
+        right: bool = false,
+        up: bool = false,
+        down: bool = false,
+        _padding: u4 = 0,
+    };
+};
+
+/// One instance per terminal cell with a glyph.
+pub const CellText = extern struct {
+    glyph_pos: [2]u32 align(8) = .{ 0, 0 },
+    glyph_size: [2]u32 align(8) = .{ 0, 0 },
+    bearings: [2]i16 align(4) = .{ 0, 0 },
+    grid_pos: [2]u16 align(4),
+    color: [4]u8 align(4),
+    atlas: Atlas align(1),
+    bools: packed struct(u8) {
+        no_min_contrast: bool = false,
+        is_cursor_glyph: bool = false,
+        _padding: u6 = 0,
+    } align(1) = .{},
+
+    pub const Atlas = enum(u8) {
+        grayscale = 0,
+        color = 1,
+    };
+
+    test {
+        try std.testing.expectEqual(32, @sizeOf(CellText));
+    }
+};
+
+/// One instance per terminal cell, just the background color.
 pub const CellBg = [4]u8;
-pub const Image = extern struct {};
-pub const BgImage = extern struct {};
+
+/// One instance per inline image cell.
+pub const Image = extern struct {
+    grid_pos: [2]f32,
+    cell_offset: [2]f32,
+    source_rect: [4]f32,
+    dest_size: [2]f32,
+};
+
+/// One instance for the background image (configured via `background-image`).
+pub const BgImage = extern struct {
+    opacity: f32 align(4),
+    info: Info align(1),
+
+    pub const Info = packed struct(u8) {
+        position: Position,
+        fit: Fit,
+        repeat: bool,
+        _padding: u1 = 0,
+
+        pub const Position = enum(u4) {
+            tl = 0,
+            tc = 1,
+            tr = 2,
+            ml = 3,
+            mc = 4,
+            mr = 5,
+            bl = 6,
+            bc = 7,
+            br = 8,
+        };
+
+        pub const Fit = enum(u2) {
+            contain = 0,
+            cover = 1,
+            stretch = 2,
+            none = 3,
+        };
+    };
+};

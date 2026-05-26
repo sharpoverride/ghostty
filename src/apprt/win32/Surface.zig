@@ -46,22 +46,26 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
     const window = try Window.create(alloc, @ptrCast(parent_hwnd));
     errdefer window.deinit();
 
-    // D3D11 proof-of-life: build the COM stack, clear-to-blue + present
-    // once, then tear down. Verifies the D3D11/DXGI bring-up works on
-    // this HWND before WGL takes the HDC. Phase 2 will keep this
-    // context alive and route the engine through it instead of WGL.
-    //
-    // NOTE: the SetPixelFormat that WGL does next would conflict with
-    // D3D11's claim on the HDC if both stayed alive — we destroy this
-    // D3D11 context immediately, releasing the swap chain, before WGL
-    // takes over. The visible blue flash is the validation signal.
+    // D3D11 proof-of-life: build the COM stack, drive a short color-cycle
+    // animation, then tear down. Verifies not just one-shot clear+present
+    // but a sustained render loop on the swap chain. WGL takes over the
+    // HDC afterward — Phase 2 will replace WGL with D3D11 outright once
+    // the GraphicsAPI surface is implemented.
     if (d3d11.Context.init(window.hwnd)) |d3d_ctx| {
         var ctx_mut = d3d_ctx;
-        // Bright blue so we can see it against any background.
-        ctx_mut.clearAndPresent(.{ 0.2, 0.4, 1.0, 1.0 });
-        std.Thread.sleep(150 * std.time.ns_per_ms); // hold so it's visible
+        // ~2s color cycle through blue → magenta → cyan, ~60fps.
+        const frames: u32 = 120;
+        var i: u32 = 0;
+        while (i < frames) : (i += 1) {
+            const t: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(frames));
+            const r: f32 = 0.5 + 0.5 * @sin(t * std.math.pi * 2.0);
+            const g: f32 = 0.3 + 0.3 * @sin(t * std.math.pi * 2.0 + 2.0);
+            const b: f32 = 0.7 + 0.3 * @cos(t * std.math.pi * 2.0);
+            ctx_mut.clearAndPresent(.{ r, g, b, 1.0 });
+            std.Thread.sleep(16 * std.time.ns_per_ms);
+        }
         ctx_mut.deinit();
-        log.info("D3D11 proof-of-life: clear-to-blue presented, tearing down", .{});
+        log.info("D3D11 proof-of-life: color cycle complete, tearing down", .{});
     } else |e| {
         log.warn("D3D11 proof-of-life FAILED: {}", .{e});
     }
