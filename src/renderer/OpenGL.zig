@@ -383,6 +383,32 @@ pub fn present(self: *OpenGL, target: Target) !void {
         apprt.win32 => @import("../apprt/win32/gl.zig").swapCurrent(),
         else => {},
     }
+
+    // FPS counter — published as an atomic so the apprt can read it (we
+    // show it in the title bar so it's always visible). Reset every
+    // second.
+    Fps.count += 1;
+    const now_ms = std.time.milliTimestamp();
+    if (Fps.last_ms == 0) Fps.last_ms = now_ms;
+    if (now_ms - Fps.last_ms >= 1000) {
+        Fps.value.store(Fps.count, .monotonic);
+        Fps.count = 0;
+        Fps.last_ms = now_ms;
+    }
+}
+
+const Fps = struct {
+    var count: u32 = 0;
+    var last_ms: i64 = 0;
+    /// Last measured frames-per-second value. Updated once per second
+    /// from `present`. Apprts can read it via `currentFps()`.
+    var value: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+};
+
+/// Returns the last frames-per-second sample (updated once per second).
+/// Used by the win32 apprt to surface FPS in the title bar.
+pub fn currentFps() u32 {
+    return Fps.value.load(.monotonic);
 }
 
 /// Present the last presented target again.

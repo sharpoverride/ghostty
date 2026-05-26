@@ -15,6 +15,7 @@ const std = @import("std");
 const windows = std.os.windows;
 const Allocator = std.mem.Allocator;
 const Surface = @import("Surface.zig");
+const ApprtApp = @import("App.zig");
 
 const HWND = windows.HWND;
 const HINSTANCE = windows.HINSTANCE;
@@ -60,8 +61,14 @@ const WM_QUIT: UINT = 0x0012;
 const WM_NCCREATE: UINT = 0x0081;
 const WM_PAINT: UINT = 0x000F;
 const WM_ERASEBKGND: UINT = 0x0014;
+const WM_TIMER: UINT = 0x0113;
+const WM_DPICHANGED: UINT = 0x02E0;
 
 const WA_INACTIVE: u16 = 0;
+const MONITOR_DEFAULTTONULL: DWORD = 0;
+const AUTOHEAL_TIMER_ID: usize = 1;
+/// Period for the auto-heal sweep (off-screen drift + focus mismatch).
+const AUTOHEAL_INTERVAL_MS: UINT = 2_000;
 
 const POINT = extern struct { x: i32, y: i32 };
 const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
@@ -121,6 +128,19 @@ extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) callconv(.winapi) 
 extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, X: i32, Y: i32, cx: i32, cy: i32, uFlags: UINT) callconv(.winapi) BOOL;
 extern "user32" fn GetStockObject(i: i32) callconv(.winapi) HBRUSH;
 extern "user32" fn SetFocus(hWnd: ?HWND) callconv(.winapi) ?HWND;
+extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
+extern "user32" fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) callconv(.winapi) ?*anyopaque;
+extern "user32" fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: UINT, lpTimerFunc: ?*anyopaque) callconv(.winapi) usize;
+extern "user32" fn KillTimer(hWnd: HWND, uIDEvent: usize) callconv(.winapi) BOOL;
+extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: [*:0]const u16) callconv(.winapi) BOOL;
+extern "user32" fn PostMessageW(hWnd: ?HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
+
+const WM_APP: UINT = 0x8000;
+/// Title-set custom message: wparam = u16 length (incl. NUL terminator),
+/// lparam = pointer (cast) to a c-allocator-owned UTF-16 buffer. The
+/// WndProc takes ownership and frees.
+const WM_APP_SET_TITLE: UINT = WM_APP + 1;
 
 const SWP_NOZORDER: UINT = 0x0004;
 const SWP_NOACTIVATE: UINT = 0x0010;
@@ -138,14 +158,19 @@ extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const RECT, bErase: BOO
 pub const tab_strip_height: i32 = 0;
 
 alloc: Allocator,
+app: *ApprtApp,
 hwnd: HWND,
-/// Single tab today. Will become a list once multi-tab UI lands.
-surface: ?*Surface = null,
+/// One Surface per tab. Active tab is shown via ShowWindow(SW_SHOW);
+/// inactive tabs are SW_HIDE'd but their CoreSurface, ConPTY, and
+/// renderer thread keep running so scrollback / shell state survive
+/// switching.
+tabs: std.array_list.Managed(*Surface),
+active: usize = 0,
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWin32Parent");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
 
-pub fn create(alloc: Allocator) !*Self {
+pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
     const hmodule = GetModuleHandleW(null);
     const hinstance: HINSTANCE = @ptrFromInt(@intFromPtr(hmodule));
 
@@ -168,7 +193,9 @@ pub fn create(alloc: Allocator) !*Self {
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
+        .app = app,
         .hwnd = undefined,
+        .tabs = std.array_list.Managed(*Surface).init(alloc),
     };
 
     const hwnd = CreateWindowExW(
@@ -191,26 +218,149 @@ pub fn create(alloc: Allocator) !*Self {
     _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
     _ = UpdateWindow(hwnd);
 
+    // Auto-heal timer: catches edge cases where the window drifts off
+    // all monitors after a multi-monitor reconfiguration, or where the
+    // active child loses focus while we're the foreground. Periodic
+    // rather than reactive because the OS-level events that should
+    // trigger fixes (WM_ACTIVATE, monitor change) don't always fire
+    // reliably in cross-DPI / cross-monitor drag scenarios.
+    _ = SetTimer(hwnd, AUTOHEAL_TIMER_ID, AUTOHEAL_INTERVAL_MS, null);
+
     return self;
 }
 
 pub fn deinit(self: *Self) void {
-    if (self.surface) |s| s.deinit();
+    _ = KillTimer(self.hwnd, AUTOHEAL_TIMER_ID);
+    for (self.tabs.items) |s| s.deinit();
+    self.tabs.deinit();
     self.alloc.destroy(self);
 }
 
-/// Attach a Surface as the (currently only) tab. Resizes its child HWND
-/// to fill the client area below the tab strip. Caller transfers
-/// ownership; ParentWindow's deinit will drop the Surface too.
-pub fn attachSurface(self: *Self, surface: *Surface) void {
-    self.surface = surface;
+/// Periodic check for the two failure modes we've actually observed:
+/// 1. Parent window center is off every monitor — usually after a
+///    multi-monitor drag where the OS reported a position we accepted
+///    but isn't reachable. Snap back to (100, 100).
+/// 2. Parent has foreground activation but the active child doesn't
+///    hold keyboard focus — input would silently go nowhere. SetFocus
+///    on the active child.
+fn autoHeal(self: *Self) void {
+    // (1) off-screen
+    if (MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) == null) {
+        log.warn("auto-heal: window has no monitor overlap, snapping to (100,100)", .{});
+        var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = GetClientRect(self.hwnd, &r);
+        const w = @max(800, r.right - r.left);
+        const h = @max(600, r.bottom - r.top);
+        _ = SetWindowPos(self.hwnd, null, 100, 100, w, h, SWP_NOZORDER);
+    }
+
+    // (2) focus mismatch
+    if (GetForegroundWindow() == self.hwnd) {
+        if (self.activeSurface()) |s| {
+            if (GetFocus() != s.window.hwnd) {
+                log.warn("auto-heal: foreground but child unfocused, restoring", .{});
+                _ = SetFocus(s.window.hwnd);
+            }
+        }
+    }
+}
+
+/// Active surface getter — returns the currently visible tab, or null
+/// if there are no tabs (transient state during teardown).
+pub fn activeSurface(self: *const Self) ?*Surface {
+    if (self.tabs.items.len == 0) return null;
+    return self.tabs.items[self.active];
+}
+
+/// Append a Surface as a new tab and switch focus to it. Caller
+/// transfers ownership; ParentWindow's deinit will drop the Surface.
+pub fn appendTab(self: *Self, surface: *Surface) !void {
+    try self.tabs.append(surface);
+    // Hide all the others, show the new one.
+    self.active = self.tabs.items.len - 1;
+    self.applyActiveVisibility();
     self.layoutActive();
 }
 
+/// Spawn a brand-new tab from scratch and switch to it.
+pub fn newTab(self: *Self) !void {
+    const surface = try Surface.create(self.alloc, self.app, @ptrCast(self.hwnd));
+    errdefer surface.deinit();
+    try self.appendTab(surface);
+}
+
+/// Close a tab by index. Closing the last tab tears down the window.
+pub fn closeTab(self: *Self, idx: usize) void {
+    if (idx >= self.tabs.items.len) return;
+    const surface = self.tabs.orderedRemove(idx);
+    surface.deinit();
+
+    if (self.tabs.items.len == 0) {
+        // Last tab gone — close the window.
+        PostQuitMessage(0);
+        return;
+    }
+
+    // Adjust active index and re-show.
+    if (self.active >= self.tabs.items.len) {
+        self.active = self.tabs.items.len - 1;
+    } else if (self.active > idx) {
+        self.active -= 1;
+    }
+    self.applyActiveVisibility();
+    self.layoutActive();
+}
+
+/// Switch the active tab to `idx`.
+pub fn switchTab(self: *Self, idx: usize) void {
+    if (idx >= self.tabs.items.len or idx == self.active) return;
+    self.active = idx;
+    self.applyActiveVisibility();
+    self.layoutActive();
+}
+
+/// Set the top-level window's title bar text from a UTF-8 string.
+/// Thread-safe: posts a custom message to the UI thread which does the
+/// SetWindowTextW call. Buffer ownership transfers to the message.
+pub fn setTitle(self: *const Self, title: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    var buf = try alloc.alloc(u16, title.len + 1);
+    errdefer alloc.free(buf);
+    const written = try std.unicode.utf8ToUtf16Le(buf, title);
+    buf[written] = 0;
+    const ptr_lparam: LPARAM = @bitCast(@as(usize, @intFromPtr(buf.ptr)));
+    const len_wparam: WPARAM = @intCast(buf.len);
+    if (PostMessageW(self.hwnd, WM_APP_SET_TITLE, len_wparam, ptr_lparam) == FALSE) {
+        alloc.free(buf);
+        return;
+    }
+}
+
+/// Cycle to the next (offset=+1) or previous (offset=-1) tab.
+pub fn cycleTab(self: *Self, offset: i32) void {
+    if (self.tabs.items.len < 2) return;
+    const n: i32 = @intCast(self.tabs.items.len);
+    const cur: i32 = @intCast(self.active);
+    var next: i32 = @mod(cur + offset, n);
+    if (next < 0) next += n;
+    self.switchTab(@intCast(next));
+}
+
+/// Hide every inactive child, show + focus the active one.
+fn applyActiveVisibility(self: *Self) void {
+    for (self.tabs.items, 0..) |s, i| {
+        const cmd: i32 = if (i == self.active) 5 else 0; // SW_SHOW vs SW_HIDE
+        _ = ShowWindow(s.window.hwnd, cmd);
+    }
+    if (self.activeSurface()) |active| {
+        _ = SetFocus(active.window.hwnd);
+    }
+}
+
 /// Resize the active tab's child HWND to fill the client area below the
-/// tab strip. Invoked on WM_SIZE and on first attach.
+/// tab strip. Invoked on WM_SIZE and on first attach / tab switch.
 fn layoutActive(self: *Self) void {
-    const surface = self.surface orelse return;
+    const surface = self.activeSurface() orelse return;
     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &rect);
     const w = @max(0, rect.right - rect.left);
@@ -257,18 +407,53 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_SIZE => {
             if (recoverSelf(hwnd)) |self| self.layoutActive();
         },
+        WM_DPICHANGED => {
+            // lparam points to the OS-suggested RECT for the new DPI.
+            // Honoring it verbatim is what Windows Terminal does (see
+            // BaseWindow.h::HandleDpiChange). Without this the window
+            // tends to drift between monitors during cross-DPI drag and
+            // can land off-screen.
+            const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            _ = SetWindowPos(
+                hwnd,
+                null,
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            return 0;
+        },
+        WM_TIMER => {
+            if (wparam == AUTOHEAL_TIMER_ID) {
+                if (recoverSelf(hwnd)) |self| self.autoHeal();
+                return 0;
+            }
+        },
+        WM_APP_SET_TITLE => {
+            const len: usize = @intCast(wparam);
+            const ptr_int: usize = @bitCast(lparam);
+            if (ptr_int != 0 and len > 0) {
+                const ptr: [*]u16 = @ptrFromInt(ptr_int);
+                _ = SetWindowTextW(hwnd, @ptrCast(ptr));
+                std.heap.c_allocator.free(ptr[0..len]);
+            }
+            return 0;
+        },
         WM_ACTIVATE => {
-            // When the parent regains activation (alt-tab back, monitor
-            // switch with focus restore, click on title bar) we need to
-            // restore focus to the active child explicitly. Windows
-            // doesn't propagate focus through the parent automatically,
-            // so without this the child stays unfocused → engine keeps
-            // rendering paused (cursor blink off, no redraws) until the
-            // user clicks back into the terminal area.
+            // Restore focus to the active child on activation — but only
+            // if it doesn't already have it. Unconditionally calling
+            // SetFocus on every WM_ACTIVATE causes redundant KILLFOCUS/
+            // SETFOCUS cycles that the engine treats as real focus
+            // transitions, leading to focus-event spam and apparent
+            // input loss during rapid alt-tab.
             const active_lo: u16 = @intCast(wparam & 0xFFFF);
             if (active_lo != WA_INACTIVE) {
                 if (recoverSelf(hwnd)) |self| {
-                    if (self.surface) |s| _ = SetFocus(s.window.hwnd);
+                    if (self.activeSurface()) |s| {
+                        if (GetFocus() != s.window.hwnd) _ = SetFocus(s.window.hwnd);
+                    }
                 }
             }
         },

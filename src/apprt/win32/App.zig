@@ -29,7 +29,7 @@ pub fn init(
 
 pub fn run(self: *App) !void {
     log.info("App.run: creating parent window", .{});
-    const parent = try ParentWindow.create(self.core_app.alloc);
+    const parent = try ParentWindow.create(self.core_app.alloc, self);
     self.parent = parent;
     defer {
         log.info("App.run: parent.deinit", .{});
@@ -38,9 +38,8 @@ pub fn run(self: *App) !void {
         log.info("App.run: parent.deinit returned", .{});
     }
 
-    log.info("App.run: creating initial surface", .{});
-    const surface = try Surface.create(self.core_app.alloc, self, @ptrCast(parent.hwnd));
-    parent.attachSurface(surface);
+    log.info("App.run: creating initial tab", .{});
+    try parent.newTab();
 
     log.info("App.run: entering message pump", .{});
     try parent.run();
@@ -61,18 +60,19 @@ pub fn performAction(
     comptime action: apprt.Action.Key,
     value: apprt.Action.Value(action),
 ) !bool {
-    _ = self;
     return switch (action) {
         .set_title => blk: {
             // .set_title is always per-surface — the engine never sends it
-            // with .app target. CoreSurface stores back-pointers, so we go
-            // CoreSurface → rt_surface (our apprt Surface) → window.
+            // with .app target. We route to the parent's title bar (the
+            // visible chrome); the child window has its own text but it's
+            // not displayed.
             const core_surface = switch (target) {
-                .surface => |s| s,
+                .surface => |_| {},
                 .app => break :blk false,
             };
-            const rt_surface = core_surface.rt_surface;
-            try rt_surface.window.setTitle(value.title);
+            _ = core_surface;
+            const parent = self.parent orelse break :blk false;
+            try parent.setTitle(value.title);
             break :blk true;
         },
 

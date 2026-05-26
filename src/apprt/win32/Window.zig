@@ -15,6 +15,7 @@ const input = @import("../../input.zig");
 const apprt = @import("../../apprt.zig");
 const termio = @import("../../termio.zig");
 const terminal = @import("../../terminal/main.zig");
+const OpenGL = @import("../../renderer/OpenGL.zig");
 const Surface = @import("Surface.zig");
 
 const HANDLE = windows.HANDLE;
@@ -293,6 +294,14 @@ last_mouse_y: i32 = 0,
 heartbeat_thread: ?std.Thread = null,
 heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+/// Forced refresh thread: signals renderer.draw_now every ~16ms so the
+/// terminal redraws at ~60fps continuously regardless of whether the
+/// engine considers itself dirty. Without this the engine renders
+/// lazily (only on changes) and bursts of pty output get coalesced
+/// into a single visible frame — what reads as "bulky" typing.
+refresh_thread: ?std.Thread = null,
+refresh_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
 /// Adapter thread: drains engine-bound events (keys, focus, size, mouse,
 /// scroll) and calls into CoreSurface callbacks. CoreSurface's callbacks
 /// push into per-thread mailboxes with `.forever` semantics — when the
@@ -494,6 +503,14 @@ pub fn create(alloc: Allocator, parent_hwnd: HWND) !*Self {
         break :blk null;
     };
 
+    // (Forced refresh thread temporarily disabled — was running drawFrame
+    // at 60fps unconditionally and contending with io_thread for CPU +
+    // the engine's renderer_state mutex, which made typing feedback
+    // arrive in bursts. Local echo gives us instant visual feedback for
+    // typed chars; the engine's own renderer_wakeup notifies on pty
+    // output handles the rest.)
+    _ = refreshLoop; // keep symbol live for the deinit cleanup path
+
     // Spin up the engine adapter thread. UI thread enqueues events here
     // and returns; this thread drains the queue and calls into CoreSurface
     // callbacks (which can block on engine mailboxes — fine, not the UI).
@@ -514,6 +531,19 @@ fn heartbeatLoop(self: *Self) void {
     }
 }
 
+fn refreshLoop(self: *Self) void {
+    // Wake the renderer every ~16ms (≈60fps) so each new pty byte that
+    // arrives shows up in the very next frame instead of waiting for
+    // the engine's lazy redraw heuristic. The renderer's drawFrame(sync=
+    // true) path bypasses the dirty-state gate so we get real frames.
+    const interval_ns: u64 = 16 * std.time.ns_per_ms;
+    while (!self.refresh_stop.load(.seq_cst)) {
+        std.Thread.sleep(interval_ns);
+        const surface = self.surface orelse continue;
+        surface.core_surface.renderer_thread.draw_now.notify() catch {};
+    }
+}
+
 /// Format the KEY_EVENT_RECORD-style escape sequence used by conhost /
 /// Windows Terminal when Win32 input mode (DECSET 9001) is active and
 /// queue it as a small pty write. Layout:
@@ -528,6 +558,24 @@ fn heartbeatLoop(self: *Self) void {
 /// We use the LEFT_* variants for ctrl/alt since the win32 apprt's
 /// `currentMods()` only tracks the combined VK_CONTROL / VK_MENU.
 fn sendWin32InputRecord(surface: *Surface, k: QueuedKey) void {
+    // Filter modifier-only keys. Programs in Win32 input mode only need
+    // the modifier STATE (already carried in control_keys on the next
+    // letter event); standalone Shift/Ctrl/Alt/Win/Lock records confuse
+    // some TUI input parsers. Windows Terminal does the equivalent in
+    // Terminal.hpp IsInputKey (filters VK_CONTROL/MENU/SHIFT/LWIN/RWIN).
+    switch (k.vk) {
+        0x10, // VK_SHIFT
+        0x11, // VK_CONTROL
+        0x12, // VK_MENU (Alt)
+        0x14, // VK_CAPITAL (CapsLock)
+        0x5B, // VK_LWIN
+        0x5C, // VK_RWIN
+        0x90, // VK_NUMLOCK
+        0x91, // VK_SCROLL
+        => return,
+        else => {},
+    }
+
     const down: u8 = switch (k.action) {
         .press, .repeat => 1,
         .release => 0,
@@ -559,7 +607,10 @@ fn sendWin32InputRecord(surface: *Surface, k: QueuedKey) void {
     } else if (k.vk == 0x09) {
         uchar = 0x09;
     } else if (k.vk == 0x08) {
-        uchar = 0x08;
+        // Ctrl+Backspace conventionally sends DEL (0x7F) in conhost so
+        // shell line editors (cmd, PSReadLine, readline) recognize it as
+        // delete-word. Plain Backspace stays BS (0x08).
+        uchar = if (k.mods.ctrl) 0x7F else 0x08;
     } else if (k.vk == 0x1B) {
         uchar = 0x1B;
     } else if (k.utf8_len > 0) {
@@ -613,6 +664,32 @@ fn engineLoop(self: *Self) void {
                     defer surface.core_surface.renderer_state.mutex.unlock();
                     break :blk term.modes.get(.win32_input_mode);
                 };
+
+                // Predictive local echo. Conhost auto-enables Win32 input
+                // mode (DEC 9001) for any ConPTY-spawned program — including
+                // plain cmd / pwsh — so `win32_mode` is a poor gate here.
+                // Instead skip only when the program has switched to the
+                // ALT SCREEN (TUIs like claude / vim / htop / k9s). Plain
+                // shell prompts (cmd / pwsh / bash) stay on the main screen,
+                // and their echoed char always lands at the current cursor
+                // position — exactly where our prediction wrote it.
+                const alt_screen = blk2: {
+                    surface.core_surface.renderer_state.mutex.lock();
+                    defer surface.core_surface.renderer_state.mutex.unlock();
+                    break :blk2 term.screens.active_key == .alternate;
+                };
+                if (!alt_screen and
+                    k.action == .press and
+                    !k.mods.ctrl and !k.mods.alt and
+                    k.utf8_len == 1 and
+                    k.utf8_buf[0] >= 0x20 and k.utf8_buf[0] <= 0x7E)
+                {
+                    const cp: u21 = k.utf8_buf[0];
+                    surface.core_surface.renderer_state.mutex.lock();
+                    surface.core_surface.io.terminal.print(cp) catch {};
+                    surface.core_surface.renderer_state.mutex.unlock();
+                    surface.core_surface.renderer_thread.draw_now.notify() catch {};
+                }
                 // Log transitions so we can correlate freezes / weird key
                 // behavior against whether the program opted into 9001.
                 if (win32_mode != self.win32_mode_last) {
@@ -661,6 +738,22 @@ fn engineLoop(self: *Self) void {
                 }
             },
             .focus => |f| {
+                // Suppress focus-LOSS propagation. With DECSET 1004
+                // (focus event reporting) commonly enabled by modern
+                // TUIs (htop, k9s, claude), telling the engine we lost
+                // focus would cause the engine to write `\x1b[O` to the
+                // pty, and those apps pause their refresh until they
+                // see focus regained. The result is a frozen-looking
+                // terminal whenever the user alt-tabs away — even
+                // though the program is still running. Telling the
+                // engine we are always focused keeps live TUI output
+                // flowing regardless of OS-level focus state.
+                //
+                // The cursor restoration we still need for the OS side
+                // (SetFocus on child) is handled separately in
+                // ParentWindow's WM_ACTIVATE handler — it doesn't go
+                // through the engine.
+                if (!f) continue;
                 surface.core_surface.focusCallback(f) catch |e| {
                     log.warn("focusCallback err: {}", .{e});
                 };
@@ -695,6 +788,8 @@ pub fn deinit(self: *Self) void {
     if (self.engine_thread) |t| t.join();
     self.heartbeat_stop.store(true, .seq_cst);
     if (self.heartbeat_thread) |t| t.join();
+    self.refresh_stop.store(true, .seq_cst);
+    if (self.refresh_thread) |t| t.join();
     if (self.font) |f| _ = DeleteObject(f);
     if (self.bg_brush) |b| _ = DeleteObject(b);
     self.alloc.destroy(self);
@@ -809,10 +904,23 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_APP_HEARTBEAT => {
-            // If this stops appearing in the log while the watchdog thread
-            // is still posting, the UI message pump is wedged. The
-            // immediately preceding log lines should show what wedged it.
+            // Watchdog tick — also publishes the most recent FPS sample
+            // to the title bar so it's always visible without tailing the
+            // log. Title must be set on the top-level parent HWND (the
+            // visible chrome); SetWindowTextW on our child changes only
+            // the invisible child window text.
             log.debug("heartbeat seq={d}", .{wparam});
+            if (recoverSelf(hwnd)) |self| {
+                if (self.surface) |s| if (s.app.parent) |p| {
+                    var buf: [64]u8 = undefined;
+                    const title = std.fmt.bufPrint(
+                        &buf,
+                        "Ghostty - FPS={d}",
+                        .{OpenGL.currentFps()},
+                    ) catch return 0;
+                    p.setTitle(title) catch {};
+                };
+            }
             return 0;
         },
         WM_SIZE => forwardSize(hwnd, lparam),
@@ -1036,11 +1144,42 @@ fn computeUtf8(vk: UINT, scan_code: UINT, utf8_buf: []u8) usize {
 
 fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) void {
     const self = recoverSelf(hwnd) orelse return;
-    _ = self.surface orelse return;
+    const surface = self.surface orelse return;
     const vk: u32 = @intCast(wparam);
     const scan_code: u32 = @intCast((lparam >> 16) & 0xFF);
     const key = vkToInputKey(vk);
     const mods = currentMods();
+
+    // Window-level keybindings (tab management). Intercept BEFORE the
+    // engine sees them so terminal apps don't also receive these keys.
+    // Only on press to avoid double-firing on key repeat.
+    if (action == .press and mods.ctrl) {
+        const parent = surface.app.parent;
+        if (parent) |p| {
+            // Ctrl+Shift+T → new tab
+            if (mods.shift and vk == 0x54) {
+                p.newTab() catch |e| log.warn("newTab failed: {}", .{e});
+                return;
+            }
+            // Ctrl+W → close current tab (without shift; Ctrl+Shift+W
+            // historically opens history in some apps, avoid collision).
+            if (!mods.shift and vk == 0x57) {
+                p.closeTab(p.active);
+                return;
+            }
+            // Ctrl+Tab → next tab, Ctrl+Shift+Tab → previous tab.
+            if (vk == 0x09) {
+                p.cycleTab(if (mods.shift) -1 else 1);
+                return;
+            }
+            // Ctrl+1..9 → direct tab selection by index.
+            if (!mods.shift and vk >= 0x31 and vk <= 0x39) {
+                const idx: usize = @intCast(vk - 0x31);
+                p.switchTab(idx);
+                return;
+            }
+        }
+    }
 
     // NOTE: we deliberately do NOT promote press→repeat for held keys.
     // Ghostty's terminal encode path inserts text on every .press and
@@ -1074,15 +1213,9 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
         break :blk @intCast(ch);
     };
 
-    log.debug("forwardKey vk=0x{X} action={s} mods=c{}/a{}/s{} unshifted=0x{X} utf8={X}", .{
-        vk,
-        @tagName(action),
-        @intFromBool(mods.ctrl),
-        @intFromBool(mods.alt),
-        @intFromBool(mods.shift),
-        @as(u32, unshifted),
-        utf8,
-    });
+    // (Per-keystroke trace log intentionally omitted — formatting + the
+    // stderr flush were measurable input-to-display latency in debug
+    // builds. Re-enable behind an env var if needed for diagnostics.)
 
     var qk: QueuedKey = .{
         .action = action,
