@@ -9,12 +9,20 @@ const internal_os = @import("../os/main.zig");
 
 const log = std.log.scoped(.shell_integration);
 
+/// PowerShell shell integration script. Unlike POSIX shells (which auto-source
+/// from a directory we point them at via env vars), PowerShell has no such
+/// hook, so we embed the script and inject it directly via -EncodedCommand.
+const powershell_integration = @embedFile(
+    "../shell-integration/powershell/ghostty-integration.ps1",
+);
+
 /// Shell types we support
 pub const Shell = enum {
     bash,
     elvish,
     fish,
     nushell,
+    powershell,
     zsh,
 };
 
@@ -70,6 +78,11 @@ pub fn setup(
             command,
             resource_dir,
             env,
+        ),
+
+        .powershell => try setupPowershell(
+            alloc_arena,
+            command,
         ),
 
         .elvish, .fish => xdg: {
@@ -133,6 +146,43 @@ test "shell integration failure" {
     try testing.expectEqual(0, env.count());
 }
 
+/// Set up PowerShell shell integration. We launch the shell with our
+/// integration script injected via `-EncodedCommand` (base64 of the script's
+/// UTF-16LE bytes, which is what PowerShell expects). `-NoExit` keeps the
+/// session interactive after the script runs, and the user's profile still
+/// loads first, so the script can wrap any existing prompt.
+///
+/// Returns a `direct` command (argv passed as-is); on Windows the executable
+/// is resolved by `Command.startWindows`.
+fn setupPowershell(
+    alloc: Allocator,
+    command: config.Command,
+) !?config.Command {
+    // Preserve whichever PowerShell the caller asked for (powershell.exe vs
+    // pwsh), falling back to powershell.exe. We only take argv0; any extra
+    // arguments in the original command are dropped in favor of ours.
+    const exe = exe: {
+        var it = try command.argIterator(alloc);
+        defer it.deinit();
+        break :exe try alloc.dupeZ(u8, it.next() orelse "powershell.exe");
+    };
+
+    // -EncodedCommand wants base64 of the script's UTF-16LE bytes.
+    const utf16 = try std.unicode.utf8ToUtf16LeAlloc(alloc, powershell_integration);
+    const bytes = std.mem.sliceAsBytes(utf16);
+    const b64 = std.base64.standard.Encoder;
+    const encoded = try alloc.allocSentinel(u8, b64.calcSize(bytes.len), 0);
+    _ = b64.encode(encoded, bytes);
+
+    const argv = try alloc.alloc([:0]const u8, 5);
+    argv[0] = exe;
+    argv[1] = "-NoLogo";
+    argv[2] = "-NoExit";
+    argv[3] = "-EncodedCommand";
+    argv[4] = encoded;
+    return .{ .direct = argv };
+}
+
 fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     var arg_iter = try command.argIterator(alloc);
     defer arg_iter.deinit();
@@ -162,6 +212,15 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     if (std.mem.eql(u8, "nu", exe)) return .nushell;
     if (std.mem.eql(u8, "zsh", exe)) return .zsh;
 
+    // PowerShell, both Windows PowerShell (powershell.exe) and the
+    // cross-platform PowerShell 7+ (pwsh). Compared case-insensitively
+    // since these come from Windows where executable names aren't
+    // case-sensitive.
+    if (std.ascii.eqlIgnoreCase("powershell", exe) or
+        std.ascii.eqlIgnoreCase("powershell.exe", exe) or
+        std.ascii.eqlIgnoreCase("pwsh", exe) or
+        std.ascii.eqlIgnoreCase("pwsh.exe", exe)) return .powershell;
+
     return null;
 }
 
@@ -175,6 +234,8 @@ test detectShell {
     try testing.expectEqual(.fish, try detectShell(alloc, .{ .shell = "fish" }));
     try testing.expectEqual(.nushell, try detectShell(alloc, .{ .shell = "nu" }));
     try testing.expectEqual(.zsh, try detectShell(alloc, .{ .shell = "zsh" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "powershell.exe" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "pwsh" }));
 
     if (comptime builtin.target.os.tag.isDarwin()) {
         try testing.expect(try detectShell(alloc, .{ .shell = "/bin/bash" }) == null);

@@ -755,7 +755,10 @@ const Subprocess = struct {
         const shell_command: configpkg.Command = shell: {
             const default_shell_command: configpkg.Command =
                 cfg.command orelse .{ .shell = switch (builtin.os.tag) {
-                    .windows => "cmd.exe",
+                    // PowerShell so we can auto-inject shell integration
+                    // (OSC 133 markers, which power click-to-move-cursor).
+                    // cmd.exe has no hook for this.
+                    .windows => "powershell.exe",
                     else => "sh",
                 } };
 
