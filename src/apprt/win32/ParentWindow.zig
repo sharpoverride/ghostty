@@ -156,14 +156,54 @@ const SWP_SHOWWINDOW: UINT = 0x0040;
 
 extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.winapi) BOOL;
 
+// GDI bits for drawing the tab strip.
+const HDC = *anyopaque;
+const COLORREF = u32;
+const PAINTSTRUCT = extern struct {
+    hdc: HDC,
+    fErase: BOOL,
+    rcPaint: RECT,
+    fRestore: BOOL,
+    fIncUpdate: BOOL,
+    rgbReserved: [32]u8,
+};
+const WM_LBUTTONDOWN: UINT = 0x0201;
+const TRANSPARENT: i32 = 1;
+const DT_LEFT: UINT = 0x0000;
+const DT_CENTER: UINT = 0x0001;
+const DT_VCENTER: UINT = 0x0004;
+const DT_SINGLELINE: UINT = 0x0020;
+const DT_END_ELLIPSIS: UINT = 0x8000;
+extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
+extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
+extern "user32" fn FillRect(hDC: HDC, lprc: *const RECT, hbr: HBRUSH) callconv(.winapi) i32;
+extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: i32, lprc: *RECT, format: UINT) callconv(.winapi) i32;
+extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) UINT;
+extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) HBRUSH;
+extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.winapi) BOOL;
+extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
+extern "gdi32" fn SetTextColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLORREF;
+extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+const DEFAULT_GUI_FONT: i32 = 17;
+
+// Tab strip geometry (logical px at 96 DPI; scaled by DPI at runtime).
+const tab_strip_base: i32 = 32;
+const tab_max_w: i32 = 240;
+const tab_min_w: i32 = 90;
+const new_btn_w: i32 = 32;
+const tab_close_w: i32 = 24;
+
 // ---------------------------------------------------------------------------
 // Public API.
 // ---------------------------------------------------------------------------
 
-/// Reserved height at the top of the client area for the (future) tab
-/// strip. Set to 0 today so the existing single-tab UX is visually
-/// identical; the multi-tab UI will bump this and start drawing.
-pub const tab_strip_height: i32 = 0;
+/// Height of the tab strip at the top of the client area, DPI-scaled.
+/// The active surface child is laid out below this band; the band itself is
+/// painted (and hit-tested) by the parent.
+fn stripHeight(self: *const Self) i32 {
+    const dpi: i32 = @intCast(GetDpiForWindow(self.hwnd));
+    return @divTrunc(tab_strip_base * dpi, 96);
+}
 
 alloc: Allocator,
 app: *ApprtApp,
@@ -391,20 +431,117 @@ fn applyActiveVisibility(self: *Self) void {
 /// tab strip. Invoked on WM_SIZE and on first attach / tab switch.
 fn layoutActive(self: *Self) void {
     const surface = self.activeSurface() orelse return;
+    const strip = self.stripHeight();
     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &rect);
     const w = @max(0, rect.right - rect.left);
-    const h = @max(0, rect.bottom - rect.top - tab_strip_height);
+    const h = @max(0, rect.bottom - rect.top - strip);
     _ = SetWindowPos(
         surface.window.hwnd,
         null,
         0,
-        tab_strip_height,
+        strip,
         w,
         h,
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
     _ = InvalidateRect(surface.window.hwnd, null, FALSE);
+    // Repaint the strip band (tab count/active may have changed).
+    self.invalidateStrip();
+}
+
+/// Mark the tab-strip band dirty so it repaints.
+fn invalidateStrip(self: *const Self) void {
+    var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = self.stripHeight() };
+    _ = GetClientRect(self.hwnd, &r);
+    r.top = 0;
+    r.bottom = self.stripHeight();
+    _ = InvalidateRect(self.hwnd, &r, FALSE);
+}
+
+/// Width of each tab given the client width and tab count.
+fn tabWidth(width: i32, n: i32) i32 {
+    if (n <= 0) return 0;
+    const avail = @max(0, width - new_btn_w);
+    return std.math.clamp(@divTrunc(avail, n), tab_min_w, tab_max_w);
+}
+
+/// Paint the tab strip. Called from WM_PAINT.
+fn paintTabStrip(self: *Self, hdc: HDC, width: i32) void {
+    const strip = self.stripHeight();
+
+    // Strip background.
+    const bg = CreateSolidBrush(0x002b2b2b);
+    var full: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = strip };
+    _ = FillRect(hdc, &full, bg);
+    _ = DeleteObject(bg);
+
+    _ = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    _ = SetBkMode(hdc, TRANSPARENT);
+
+    const n: i32 = @intCast(self.tabs.items.len);
+    const tw = tabWidth(width, n);
+
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        const x = i * tw;
+        const active = (@as(usize, @intCast(i)) == self.active);
+
+        const tab_bg = CreateSolidBrush(if (active) 0x00181818 else 0x00333333);
+        var tr: RECT = .{ .left = x + 1, .top = 3, .right = x + tw - 1, .bottom = strip };
+        _ = FillRect(hdc, &tr, tab_bg);
+        _ = DeleteObject(tab_bg);
+
+        // Title (index-based label until per-tab titles are wired).
+        var buf: [32]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "Terminal {d}", .{i + 1}) catch "Terminal";
+        var w16: [48]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&w16, label) catch 0;
+        _ = SetTextColor(hdc, if (active) 0x00ffffff else 0x00aaaaaa);
+        var lr: RECT = .{ .left = x + 10, .top = 3, .right = x + tw - tab_close_w, .bottom = strip };
+        _ = DrawTextW(hdc, &w16, @intCast(wlen), &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        // Close "x".
+        _ = SetTextColor(hdc, 0x00cccccc);
+        var cr: RECT = .{ .left = x + tw - tab_close_w, .top = 3, .right = x + tw - 2, .bottom = strip };
+        const x_glyph = [_]u16{'x'};
+        _ = DrawTextW(hdc, &x_glyph, 1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // New-tab "+" button.
+    const bx = n * tw;
+    _ = SetTextColor(hdc, 0x00cccccc);
+    var pr: RECT = .{ .left = bx, .top = 3, .right = bx + new_btn_w, .bottom = strip };
+    const plus = [_]u16{'+'};
+    _ = DrawTextW(hdc, &plus, 1, &pr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+/// Handle a left-click in the tab strip. Returns true if it was handled.
+fn onStripClick(self: *Self, x: i32, y: i32) bool {
+    if (y < 0 or y >= self.stripHeight()) return false;
+    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = GetClientRect(self.hwnd, &rect);
+    const n: i32 = @intCast(self.tabs.items.len);
+    const tw = tabWidth(rect.right, n);
+
+    // New-tab button.
+    if (x >= n * tw and x < n * tw + new_btn_w) {
+        self.newTab() catch |e| log.warn("newTab failed: {}", .{e});
+        return true;
+    }
+
+    if (tw <= 0) return false;
+    const i = @divTrunc(x, tw);
+    if (i < 0 or i >= n) return false;
+
+    // Close button region at the right edge of the tab.
+    const x_in_tab = x - i * tw;
+    if (x_in_tab >= tw - tab_close_w) {
+        self.closeTab(@intCast(i));
+    } else {
+        self.switchTab(@intCast(i));
+    }
+    return true;
 }
 
 /// Run the win32 message pump until WM_QUIT.
@@ -436,6 +573,28 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
     switch (msg) {
         WM_SIZE => {
             if (recoverSelf(hwnd)) |self| self.layoutActive();
+        },
+        WM_PAINT => {
+            if (recoverSelf(hwnd)) |self| {
+                var ps: PAINTSTRUCT = undefined;
+                if (BeginPaint(hwnd, &ps)) |hdc| {
+                    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+                    _ = GetClientRect(hwnd, &rect);
+                    self.paintTabStrip(hdc, rect.right);
+                    _ = EndPaint(hwnd, &ps);
+                }
+            }
+            return 0;
+        },
+        WM_LBUTTONDOWN => {
+            if (recoverSelf(hwnd)) |self| {
+                const x: i32 = @as(i16, @bitCast(@as(u16, @intCast(lparam & 0xFFFF))));
+                const y: i32 = @as(i16, @bitCast(@as(u16, @intCast((lparam >> 16) & 0xFFFF))));
+                if (self.onStripClick(x, y)) {
+                    self.invalidateStrip();
+                    return 0;
+                }
+            }
         },
         WM_DPICHANGED => {
             // lparam points to the OS-suggested RECT for the new DPI.
