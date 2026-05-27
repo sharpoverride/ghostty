@@ -51,7 +51,11 @@ pub fn terminate(self: *App) void {
 }
 
 pub fn wakeup(self: *App) void {
-    _ = self;
+    // The engine calls this (from any thread) when it pushes an app/surface
+    // message that needs processing — e.g. child_exited. Marshal a mailbox
+    // drain onto the UI thread. Without this, surface messages are never
+    // handled (the window wouldn't close when the shell exits).
+    if (self.parent) |p| p.requestTick();
 }
 
 pub fn performAction(

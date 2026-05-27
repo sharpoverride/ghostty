@@ -145,6 +145,10 @@ const WM_APP_SET_TITLE: UINT = WM_APP + 1;
 /// exit) to request that its tab be closed on the UI thread. wparam carries
 /// the *Surface pointer.
 const WM_APP_CLOSE_SURFACE: UINT = WM_APP + 2;
+/// Posted by App.wakeup (the engine's "process your mailbox" signal, possibly
+/// from another thread) to drain the core app mailbox on the UI thread. This
+/// is how surface messages like child_exited actually get handled.
+const WM_APP_TICK: UINT = WM_APP + 3;
 
 const SWP_NOZORDER: UINT = 0x0004;
 const SWP_NOACTIVATE: UINT = 0x0010;
@@ -348,6 +352,20 @@ pub fn requestCloseSurface(self: *const Self, surface: *Surface) void {
     _ = PostMessageW(self.hwnd, WM_APP_CLOSE_SURFACE, @intFromPtr(surface), 0);
 }
 
+/// Thread-safe: ask the UI thread to drain the core app mailbox. Called by
+/// App.wakeup, which the engine invokes whenever it pushes a surface/app
+/// message (e.g. child_exited).
+pub fn requestTick(self: *const Self) void {
+    _ = PostMessageW(self.hwnd, WM_APP_TICK, 0, 0);
+}
+
+/// Drain the core app mailbox (dispatches surface messages to handleMessage).
+/// Must run on the UI thread.
+fn tickCoreApp(self: *Self) void {
+    self.app.core_app.tick(self.app) catch |err|
+        log.warn("core app tick failed: {}", .{err});
+}
+
 /// Cycle to the next (offset=+1) or previous (offset=-1) tab.
 pub fn cycleTab(self: *Self, offset: i32) void {
     if (self.tabs.items.len < 2) return;
@@ -439,7 +457,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         WM_TIMER => {
             if (wparam == AUTOHEAL_TIMER_ID) {
-                if (recoverSelf(hwnd)) |self| self.autoHeal();
+                if (recoverSelf(hwnd)) |self| {
+                    self.autoHeal();
+                    // Fallback mailbox drain in case a wakeup was missed.
+                    self.tickCoreApp();
+                }
                 return 0;
             }
         },
@@ -451,6 +473,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 _ = SetWindowTextW(hwnd, @ptrCast(ptr));
                 std.heap.c_allocator.free(ptr[0..len]);
             }
+            return 0;
+        },
+        WM_APP_TICK => {
+            if (recoverSelf(hwnd)) |self| self.tickCoreApp();
             return 0;
         },
         WM_APP_CLOSE_SURFACE => {

@@ -113,6 +113,13 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
     // pty.WindowsPty + ConPTY).
     try self.core_surface.init(alloc, &self.config, app.core_app, app, self);
 
+    // Register with the core app so surface-targeted mailbox messages (e.g.
+    // child_exited, which closes us when the shell exits) are dispatched to
+    // our handleMessage. Without this, App.surfaceMessage's hasSurface check
+    // silently drops them.
+    errdefer self.core_surface.deinit();
+    try app.core_app.addSurface(self);
+
     // core_surface (and its renderer_thread) is now live — let the
     // forced-refresh thread start signaling draws.
     window.render_ready.store(true, .seq_cst);
@@ -121,6 +128,10 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
 }
 
 pub fn deinit(self: *Self) void {
+    // Unregister from the core app first so no further surface messages are
+    // dispatched to us mid-teardown.
+    self.app.core_app.deleteSurface(self);
+
     // Signal the renderer thread's manual loop to exit BEFORE
     // core_surface.deinit (which joins that thread). The xev stop async
     // isn't reliably delivered on Windows, so without this non-xev flag
@@ -162,13 +173,11 @@ pub fn glClearCurrent(self: *Self) void {
 // ---------------------------------------------------------------------------
 
 pub fn core(self: *Self) *CoreSurface {
-    _ = self;
-    @panic("win32 Surface.core: not yet implemented");
+    return &self.core_surface;
 }
 
 pub fn rtApp(self: *Self) *ApprtApp {
-    _ = self;
-    @panic("win32 Surface.rtApp: not yet implemented");
+    return self.app;
 }
 
 pub fn close(self: *Self, process_active: bool) void {

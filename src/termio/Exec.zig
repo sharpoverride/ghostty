@@ -29,6 +29,21 @@ const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
+/// Win32 entry points for the dedicated child-exit watcher thread (see
+/// windowsProcessWait). xev's process watcher relies on an async completion
+/// that isn't reliably delivered on Windows, so we block on the process
+/// handle directly instead.
+const win_wait = if (builtin.os.tag == .windows) struct {
+    const BOOL = std.os.windows.BOOL;
+    const INFINITE: windows.DWORD = 0xFFFFFFFF;
+    const DUPLICATE_SAME_ACCESS: windows.DWORD = 0x00000002;
+    extern "kernel32" fn WaitForSingleObject(h: windows.HANDLE, ms: windows.DWORD) callconv(.winapi) windows.DWORD;
+    extern "kernel32" fn GetExitCodeProcess(h: windows.HANDLE, code: *windows.DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn DuplicateHandle(src_proc: windows.HANDLE, src: windows.HANDLE, dst_proc: windows.HANDLE, dst: *windows.HANDLE, access: windows.DWORD, inherit: BOOL, options: windows.DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) windows.HANDLE;
+    extern "kernel32" fn CloseHandle(h: windows.HANDLE) callconv(.winapi) BOOL;
+} else struct {};
+
 const log = std.log.scoped(.io_exec);
 
 /// The termios poll rate in milliseconds.
@@ -154,8 +169,29 @@ pub fn threadEnter(
         .termios_timer = termios_timer,
     } };
 
-    // Start our process watcher. If we have an xev.Process use it.
-    if (process) |*p| p.wait(
+    // Start our process watcher. On Windows, xev's process watcher relies on
+    // an async completion that isn't reliably delivered, so the surface would
+    // never learn the child exited (window hangs on shell exit). Use a
+    // dedicated thread that blocks on the child handle instead.
+    if (comptime builtin.os.tag == .windows) win: {
+        const handle: windows.HANDLE = switch (self.subprocess.process orelse break :win) {
+            .fork_exec => |cmd| cmd.pid orelse break :win,
+            .flatpak => break :win,
+        };
+        // Duplicate the handle so our watcher's lifetime is independent of the
+        // subprocess cleanup (which closes the original).
+        var dup: windows.HANDLE = undefined;
+        const cur = win_wait.GetCurrentProcess();
+        if (win_wait.DuplicateHandle(cur, handle, cur, &dup, 0, 0, win_wait.DUPLICATE_SAME_ACCESS) == 0) {
+            log.warn("failed to duplicate child handle for exit watcher; window may not close on shell exit", .{});
+            break :win;
+        }
+        td.backend.exec.win_wait_thread = std.Thread.spawn(.{}, windowsProcessWait, .{ td, dup }) catch |err| blk: {
+            log.warn("failed to spawn child exit watcher: {}", .{err});
+            _ = win_wait.CloseHandle(dup);
+            break :blk null;
+        };
+    } else if (process) |*p| p.wait(
         td.loop,
         &td.backend.exec.process_wait_c,
         termio.Termio.ThreadData,
@@ -225,6 +261,14 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     }
 
     exec.read_thread.join();
+
+    // Join the Windows child-exit watcher. subprocess.stop() above terminated
+    // the child, so its WaitForSingleObject has returned and the thread is
+    // exiting (or already has). This must happen before ThreadData.deinit
+    // frees the mailbox the watcher posts to.
+    if (comptime builtin.os.tag == .windows) {
+        if (exec.win_wait_thread) |t| t.join();
+    }
 }
 
 pub fn focusGained(
@@ -305,6 +349,19 @@ fn processExit(
     const exit_code = r catch unreachable;
     processExitCommon(td_.?, exit_code);
     return .disarm;
+}
+
+/// Windows child-exit watcher. Blocks on a duplicated child process handle
+/// and, when the child exits, reports it via the same path as the xev
+/// watcher. Used instead of xev.Process.wait on Windows, whose completion
+/// isn't reliably delivered (IOCP). Owns `handle` and closes it. Joined in
+/// threadExit after the subprocess is stopped, so it always unblocks.
+fn windowsProcessWait(td: *termio.Termio.ThreadData, handle: windows.HANDLE) void {
+    _ = win_wait.WaitForSingleObject(handle, win_wait.INFINITE);
+    var code: windows.DWORD = 1;
+    _ = win_wait.GetExitCodeProcess(handle, &code);
+    _ = win_wait.CloseHandle(handle);
+    processExitCommon(td, code);
 }
 
 fn flatpakExit(
@@ -530,6 +587,11 @@ pub const ThreadData = struct {
     read_thread: std.Thread,
     read_thread_pipe: posix.fd_t,
     read_thread_fd: posix.fd_t,
+
+    /// Windows-only: dedicated thread that blocks on the child process handle
+    /// to detect exit (xev's process watcher is unreliable on Windows). null
+    /// on other platforms or if the watcher couldn't be started.
+    win_wait_thread: ?std.Thread = null,
 
     /// The timer to detect termios state changes.
     termios_timer: xev.Timer,
