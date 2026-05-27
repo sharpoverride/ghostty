@@ -118,7 +118,17 @@ pub const ID3D11InputLayout = extern struct {
     }
 };
 
-pub const ID3D11BlendState = opaque {};
+pub const ID3D11BlendState = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (self: *ID3D11BlendState) callconv(.winapi) u32,
+    };
+    pub fn release(self: *ID3D11BlendState) u32 {
+        return self.vtable.Release(self);
+    }
+};
 pub const ID3D11RasterizerState = opaque {};
 pub const ID3D11DepthStencilState = opaque {};
 pub const IDXGIAdapter = opaque {};
@@ -268,9 +278,19 @@ pub const ID3D11Device = extern struct {
             ppBuffer: *?*ID3D11Buffer,
         ) callconv(.winapi) HRESULT,
         CreateTexture1D: *const anyopaque,
-        CreateTexture2D: *const anyopaque,
+        CreateTexture2D: *const fn (
+            self: *ID3D11Device,
+            pDesc: *const D3D11_TEXTURE2D_DESC,
+            pInitialData: ?[*]const D3D11_SUBRESOURCE_DATA,
+            ppTexture2D: *?*ID3D11Texture2D,
+        ) callconv(.winapi) HRESULT,
         CreateTexture3D: *const anyopaque,
-        CreateShaderResourceView: *const anyopaque,
+        CreateShaderResourceView: *const fn (
+            self: *ID3D11Device,
+            pResource: *ID3D11Resource,
+            pDesc: ?*const anyopaque,
+            ppSRView: *?*ID3D11ShaderResourceView,
+        ) callconv(.winapi) HRESULT,
         CreateUnorderedAccessView: *const anyopaque,
         CreateRenderTargetView: *const fn (
             self: *ID3D11Device,
@@ -303,6 +323,22 @@ pub const ID3D11Device = extern struct {
             pClassLinkage: ?*anyopaque,
             ppPixelShader: *?*ID3D11PixelShader,
         ) callconv(.winapi) HRESULT,
+        CreateHullShader: *const anyopaque,
+        CreateDomainShader: *const anyopaque,
+        CreateComputeShader: *const anyopaque,
+        CreateClassLinkage: *const anyopaque,
+        CreateBlendState: *const fn (
+            self: *ID3D11Device,
+            pBlendStateDesc: *const D3D11_BLEND_DESC,
+            ppBlendState: *?*ID3D11BlendState,
+        ) callconv(.winapi) HRESULT,
+        CreateDepthStencilState: *const anyopaque,
+        CreateRasterizerState: *const anyopaque,
+        CreateSamplerState: *const fn (
+            self: *ID3D11Device,
+            pSamplerDesc: *const D3D11_SAMPLER_DESC,
+            ppSamplerState: *?*ID3D11SamplerState,
+        ) callconv(.winapi) HRESULT,
         // ... rest opaque for now
     };
 
@@ -325,15 +361,30 @@ pub const ID3D11DeviceContext = extern struct {
         SetPrivateData: *const anyopaque,
         SetPrivateDataInterface: *const anyopaque,
         // ID3D11DeviceContext
-        VSSetConstantBuffers: *const anyopaque,
-        PSSetShaderResources: *const anyopaque,
+        VSSetConstantBuffers: *const fn (
+            self: *ID3D11DeviceContext,
+            StartSlot: UINT,
+            NumBuffers: UINT,
+            ppConstantBuffers: [*]const *ID3D11Buffer,
+        ) callconv(.winapi) void,
+        PSSetShaderResources: *const fn (
+            self: *ID3D11DeviceContext,
+            StartSlot: UINT,
+            NumViews: UINT,
+            ppShaderResourceViews: [*]const *ID3D11ShaderResourceView,
+        ) callconv(.winapi) void,
         PSSetShader: *const fn (
             self: *ID3D11DeviceContext,
             pPixelShader: ?*ID3D11PixelShader,
             ppClassInstances: ?[*]const ?*anyopaque,
             NumClassInstances: UINT,
         ) callconv(.winapi) void,
-        PSSetSamplers: *const anyopaque,
+        PSSetSamplers: *const fn (
+            self: *ID3D11DeviceContext,
+            StartSlot: UINT,
+            NumSamplers: UINT,
+            ppSamplers: [*]const *ID3D11SamplerState,
+        ) callconv(.winapi) void,
         VSSetShader: *const fn (
             self: *ID3D11DeviceContext,
             pVertexShader: ?*ID3D11VertexShader,
@@ -346,9 +397,25 @@ pub const ID3D11DeviceContext = extern struct {
             VertexCount: UINT,
             StartVertexLocation: UINT,
         ) callconv(.winapi) void,
-        Map: *const anyopaque,
-        Unmap: *const anyopaque,
-        PSSetConstantBuffers: *const anyopaque,
+        Map: *const fn (
+            self: *ID3D11DeviceContext,
+            pResource: *ID3D11Resource,
+            Subresource: UINT,
+            MapType: D3D11_MAP,
+            MapFlags: UINT,
+            pMappedResource: *D3D11_MAPPED_SUBRESOURCE,
+        ) callconv(.winapi) HRESULT,
+        Unmap: *const fn (
+            self: *ID3D11DeviceContext,
+            pResource: *ID3D11Resource,
+            Subresource: UINT,
+        ) callconv(.winapi) void,
+        PSSetConstantBuffers: *const fn (
+            self: *ID3D11DeviceContext,
+            StartSlot: UINT,
+            NumBuffers: UINT,
+            ppConstantBuffers: [*]const *ID3D11Buffer,
+        ) callconv(.winapi) void,
         IASetInputLayout: *const fn (
             self: *ID3D11DeviceContext,
             pInputLayout: ?*ID3D11InputLayout,
@@ -363,14 +430,25 @@ pub const ID3D11DeviceContext = extern struct {
         ) callconv(.winapi) void,
         IASetIndexBuffer: *const anyopaque,
         DrawIndexedInstanced: *const anyopaque,
-        DrawInstanced: *const anyopaque,
+        DrawInstanced: *const fn (
+            self: *ID3D11DeviceContext,
+            VertexCountPerInstance: UINT,
+            InstanceCount: UINT,
+            StartVertexLocation: UINT,
+            StartInstanceLocation: UINT,
+        ) callconv(.winapi) void,
         GSSetConstantBuffers: *const anyopaque,
         GSSetShader: *const anyopaque,
         IASetPrimitiveTopology: *const fn (
             self: *ID3D11DeviceContext,
             Topology: D3D11_PRIMITIVE_TOPOLOGY,
         ) callconv(.winapi) void,
-        VSSetShaderResources: *const anyopaque,
+        VSSetShaderResources: *const fn (
+            self: *ID3D11DeviceContext,
+            StartSlot: UINT,
+            NumViews: UINT,
+            ppShaderResourceViews: [*]const *ID3D11ShaderResourceView,
+        ) callconv(.winapi) void,
         VSSetSamplers: *const anyopaque,
         Begin: *const anyopaque,
         End: *const anyopaque,
@@ -385,7 +463,12 @@ pub const ID3D11DeviceContext = extern struct {
             pDepthStencilView: ?*anyopaque,
         ) callconv(.winapi) void,
         OMSetRenderTargetsAndUnorderedAccessViews: *const anyopaque,
-        OMSetBlendState: *const anyopaque,
+        OMSetBlendState: *const fn (
+            self: *ID3D11DeviceContext,
+            pBlendState: ?*ID3D11BlendState,
+            BlendFactor: ?*const [4]f32,
+            SampleMask: UINT,
+        ) callconv(.winapi) void,
         OMSetDepthStencilState: *const anyopaque,
         SOSetTargets: *const anyopaque,
         DrawAuto: *const anyopaque,
@@ -402,7 +485,15 @@ pub const ID3D11DeviceContext = extern struct {
         RSSetScissorRects: *const anyopaque,
         CopySubresourceRegion: *const anyopaque,
         CopyResource: *const anyopaque,
-        UpdateSubresource: *const anyopaque,
+        UpdateSubresource: *const fn (
+            self: *ID3D11DeviceContext,
+            pDstResource: *ID3D11Resource,
+            DstSubresource: UINT,
+            pDstBox: ?*const D3D11_BOX,
+            pSrcData: *const anyopaque,
+            SrcRowPitch: UINT,
+            SrcDepthPitch: UINT,
+        ) callconv(.winapi) void,
         CopyStructureCount: *const anyopaque,
         ClearRenderTargetView: *const fn (
             self: *ID3D11DeviceContext,
@@ -463,12 +554,19 @@ pub const ID3DBlob = extern struct {
 /// https://learn.microsoft.com/en-us/windows/win32/api/dxgiformat/ne-dxgiformat-dxgi_format
 pub const DXGI_FORMAT = enum(UINT) {
     UNKNOWN = 0,
-    R8G8B8A8_UNORM = 28,
-    B8G8R8A8_UNORM = 87,
-    R8_UNORM = 61,
-    R32G32_FLOAT = 16,
     R32G32B32A32_FLOAT = 2,
+    R32G32B32A32_UINT = 3,
+    R32G32_FLOAT = 16,
+    R32G32_UINT = 33,
     R32_UINT = 42,
+    R8G8B8A8_UNORM = 28,
+    R8G8B8A8_UINT = 30,
+    R16G16_UINT = 36,
+    R16G16_SINT = 38,
+    R8G8_UINT = 50,
+    R8_UNORM = 61,
+    R8_UINT = 62,
+    B8G8R8A8_UNORM = 87,
     _,
 };
 
@@ -495,9 +593,12 @@ pub const D3D11_USAGE = enum(UINT) {
 };
 
 pub const D3D11_CPU_ACCESS_FLAG = packed struct(UINT) {
+    _pad_lo: u16 = 0,
+    // D3D11_CPU_ACCESS_WRITE = 0x10000 (bit 16)
     write: bool = false,
+    // D3D11_CPU_ACCESS_READ = 0x20000 (bit 17)
     read: bool = false,
-    _pad: u30 = 0,
+    _pad_hi: u14 = 0,
 };
 
 pub const D3D11_BIND_FLAG = packed struct(UINT) {
@@ -554,6 +655,74 @@ pub const D3D11_TEXTURE_ADDRESS_MODE = enum(UINT) {
     CLAMP = 3,
     BORDER = 4,
     MIRROR_ONCE = 5,
+};
+
+pub const D3D11_BLEND = enum(UINT) {
+    ZERO = 1,
+    ONE = 2,
+    SRC_COLOR = 3,
+    INV_SRC_COLOR = 4,
+    SRC_ALPHA = 5,
+    INV_SRC_ALPHA = 6,
+    DEST_ALPHA = 7,
+    INV_DEST_ALPHA = 8,
+    DEST_COLOR = 9,
+    INV_DEST_COLOR = 10,
+    _,
+};
+
+pub const D3D11_BLEND_OP = enum(UINT) {
+    ADD = 1,
+    SUBTRACT = 2,
+    REV_SUBTRACT = 3,
+    MIN = 4,
+    MAX = 5,
+};
+
+pub const D3D11_RENDER_TARGET_BLEND_DESC = extern struct {
+    BlendEnable: BOOL = 0,
+    SrcBlend: D3D11_BLEND = .ONE,
+    DestBlend: D3D11_BLEND = .ZERO,
+    BlendOp: D3D11_BLEND_OP = .ADD,
+    SrcBlendAlpha: D3D11_BLEND = .ONE,
+    DestBlendAlpha: D3D11_BLEND = .ZERO,
+    BlendOpAlpha: D3D11_BLEND_OP = .ADD,
+    RenderTargetWriteMask: u8 = 0x0F,
+};
+
+pub const D3D11_BLEND_DESC = extern struct {
+    AlphaToCoverageEnable: BOOL = 0,
+    IndependentBlendEnable: BOOL = 0,
+    RenderTarget: [8]D3D11_RENDER_TARGET_BLEND_DESC,
+};
+
+pub const D3D11_RESOURCE_MISC_BUFFER_STRUCTURED: UINT = 0x40;
+
+pub const D3D11_SRV_DIMENSION_BUFFER: UINT = 1;
+
+pub const D3D11_BUFFER_SRV = extern struct {
+    FirstElement: UINT = 0,
+    NumElements: UINT,
+    _pad_to_largest_union: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+};
+
+pub const D3D11_SHADER_RESOURCE_VIEW_DESC = extern struct {
+    Format: DXGI_FORMAT,
+    ViewDimension: UINT,
+    Buffer: D3D11_BUFFER_SRV,
+};
+
+pub const D3D11_SAMPLER_DESC = extern struct {
+    Filter: D3D11_FILTER,
+    AddressU: D3D11_TEXTURE_ADDRESS_MODE,
+    AddressV: D3D11_TEXTURE_ADDRESS_MODE,
+    AddressW: D3D11_TEXTURE_ADDRESS_MODE,
+    MipLODBias: f32 = 0,
+    MaxAnisotropy: UINT = 1,
+    ComparisonFunc: UINT = 0,
+    BorderColor: [4]f32 = .{ 0, 0, 0, 0 },
+    MinLOD: f32 = 0,
+    MaxLOD: f32 = 3.402823466e+38, // FLT_MAX
 };
 
 pub const DXGI_USAGE = packed struct(UINT) {
@@ -617,6 +786,29 @@ pub const D3D11_CREATE_DEVICE_FLAG = packed struct(UINT) {
     _pad: u30 = 0,
 };
 
+pub const D3D11_BOX = extern struct {
+    left: UINT,
+    top: UINT,
+    front: UINT,
+    right: UINT,
+    bottom: UINT,
+    back: UINT,
+};
+
+pub const D3D11_MAP = enum(UINT) {
+    READ = 1,
+    WRITE = 2,
+    READ_WRITE = 3,
+    WRITE_DISCARD = 4,
+    WRITE_NO_OVERWRITE = 5,
+};
+
+pub const D3D11_MAPPED_SUBRESOURCE = extern struct {
+    pData: ?*anyopaque,
+    RowPitch: UINT,
+    DepthPitch: UINT,
+};
+
 pub const D3D11_PRIMITIVE_TOPOLOGY = enum(UINT) {
     UNDEFINED = 0,
     POINTLIST = 1,
@@ -652,7 +844,11 @@ pub extern "dxgi" fn CreateDXGIFactory2(
     ppFactory: *?*IDXGIFactory2,
 ) callconv(.winapi) HRESULT;
 
-pub extern "d3dcompiler_47" fn D3DCompile(
+/// Signature of the D3DCompile entry point in d3dcompiler_47.dll. The
+/// DLL is loaded at runtime (LoadLibrary) rather than via static link so
+/// that we don't pull MSVC's libcmt.lib into the final binary — which
+/// would in turn require a WinMain entry point.
+pub const D3DCompileFn = *const fn (
     pSrcData: [*]const u8,
     SrcDataSize: usize,
     pSourceName: ?[*:0]const u8,
@@ -665,6 +861,21 @@ pub extern "d3dcompiler_47" fn D3DCompile(
     ppCode: *?*ID3DBlob,
     ppErrorMsgs: ?*?*ID3DBlob,
 ) callconv(.winapi) HRESULT;
+
+/// Lazily-loaded pointer to D3DCompile. Initialize with `loadD3DCompiler`
+/// before first use, then call via `D3DCompile.?(...)`.
+pub var D3DCompile: ?D3DCompileFn = null;
+
+extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?HANDLE;
+extern "kernel32" fn GetProcAddress(hModule: HANDLE, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+
+pub fn loadD3DCompiler() bool {
+    if (D3DCompile != null) return true;
+    const handle = LoadLibraryA("d3dcompiler_47.dll") orelse return false;
+    const proc = GetProcAddress(handle, "D3DCompile") orelse return false;
+    D3DCompile = @ptrCast(@alignCast(proc));
+    return true;
+}
 
 pub const D3D11_SDK_VERSION: UINT = 7;
 

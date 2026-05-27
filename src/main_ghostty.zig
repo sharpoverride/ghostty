@@ -24,6 +24,14 @@ const MainReturn = switch (build_config.artifact) {
 };
 
 pub fn main() !MainReturn {
+    // On Windows we build with `--subsystem console` so that Zig's
+    // libc-linked `main` resolves as the entry point. Without this the
+    // linker can't find WinMain. Detach the console window we inherited
+    // (if any) so the user only sees the Win32 surface.
+    if (builtin.os.tag == .windows and build_config.artifact == .exe) {
+        _ = FreeConsole();
+    }
+
     // We first start by initializing our global state. This will setup
     // process-level state we need to run the terminal. The reason we use
     // a global is because the C API needs to be able to access this state;
@@ -110,6 +118,8 @@ pub fn main() !MainReturn {
     // Run the GUI event loop
     try app_runtime.run();
 }
+
+extern "kernel32" fn FreeConsole() callconv(.winapi) c_int;
 
 // The function std.log will call.
 fn logFn(

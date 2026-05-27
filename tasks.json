@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "project": "ghostty-windows-port",
+  "branch": "windows-port",
+  "snapshot_date": "2026-05-26",
+  "working_dir": "E:\\ghosttty",
+  "build_env": {
+    "zig": "E:\\zig-x86_64-windows-0.15.2\\zig.exe",
+    "ZIG_GLOBAL_CACHE_DIR": "E:\\zig-global-cache",
+    "note": "Both vars MUST be set. The global cache MUST be on E: — cross-drive (C: cache, E: build root) triggers a `std.fs.path.relative` panic in zig 0.15 Run steps."
+  },
+  "build_commands": {
+    "opengl_default": "zig build install",
+    "d3d11_opt_in":   "zig build install -Drenderer=d3d11",
+    "run":            "Start-Process -FilePath E:\\ghosttty\\zig-out\\bin\\ghostty.exe",
+    "tip":            "Always launch via Start-Process; running ghostty.exe inheriting a console can cause early-exit when the parent shell terminates."
+  },
+  "current_state_2026_05_27": "D3D11 FULLY WORKING + now the Windows default. Renders text/bg/multi-line, input types+echoes+executes (no doubling), cursor block, 60fps continuous. THE freeze bug: D3D11 Frame.complete was a no-op → never released the SwapChain frame semaphore (swap_chain_count=3) → nextFrame() blocked forever after 3 frames → whole renderer thread froze. Fix: Frame.complete calls self.renderer.frameCompleted(.healthy). Also: win32 manual render loop in renderer/Thread.zig (run(.no_wait)+drainMailbox+updateFrame+drawFrame+sleep) replaces the blocking loop.run(.until_done) which wedges on Windows IOCP. Local echo REMOVED (cmd echoes + renders fine now, local echo only doubled). backend.zig default flipped to .d3d11 for windows.",
+  "current_state": {
+    "default_renderer_windows": "opengl (WGL)",
+    "d3d11_dispatch": "GenericRenderer(D3D11) compiles AND runs end-to-end. swap_chain attached to HWND via threadEnter; Buffer (Map/Unmap), Texture (CreateTexture2D + SRV + UpdateSubresource), Target (RT+SRV bind), Pipeline (D3DCompile + CreateVertexShader/PixelShader), and Shaders.init (no-op HLSL stamped into all 5 PipelineCollection slots) all functional. RenderPass.step is still a no-op so glyphs don't draw — `drawFrameEnd` clears to #181818 and presents.",
+    "opengl_status": "fully functional — input + rendering verified post local-echo removal",
+    "subsystem": "Console (FreeConsole at startup hides the inherited console).",
+    "d3dcompiler": "loaded at runtime via LoadLibraryA('d3dcompiler_47.dll') in src/renderer/d3d11/api.zig::loadD3DCompiler. Not linked statically (would pull libcmt → WinMain requirement).",
+    "key_bug_fix": "D3D11_CPU_ACCESS_FLAG packed-struct had bits 0/1 for write/read but D3D11 actually uses bits 16/17 (0x10000 / 0x20000). Without this, CreateBuffer for DYNAMIC + CPU_WRITE returned E_INVALIDARG. See `src/renderer/d3d11/api.zig::D3D11_CPU_ACCESS_FLAG`.",
+    "session_notes": "See C:\\Users\\mihai.lazar\\.claude\\projects\\E--\\memory\\project_ghostty_windows_port.md — `Session 7 deliverables (2026-05-26)` has the full delta."
+  },
+  "tasks": [
+    {
+      "id": 4,
+      "status": "completed",
+      "title": "D3D11: swap chain via threadEnter (heap SwapState)",
+      "files": [
+        "src/renderer/D3D11.zig"
+      ],
+      "directions": [
+        "DONE: added `SwapState` heap struct, `factory: *IDXGIFactory2`, `swap: *SwapState` field.",
+        "DONE: init() creates D3D11 device + DXGI factory + heap-alloc SwapState.",
+        "DONE: deinit() releases RTV, swap chain, factory, context, device, destroys SwapState.",
+        "DONE: ensureSwapChain(hwnd, w, h) — handles both create (CreateSwapChainForHwnd) and resize (ResizeBuffers + new RTV).",
+        "DONE: threadEnter calls ensureSwapChain with GetClientRect dims.",
+        "DONE: drawFrameStart re-checks client rect each frame → ensureSwapChain (idempotent at same size).",
+        "DONE: drawFrameEnd clears RTV to #181818 + Present.",
+        "DONE: surfaceSize returns swap.width/height.",
+        "DONE: present + presentLastTarget no-ops (drawFrameEnd is the real present).",
+        "TODO: verify build with `-Drenderer=d3d11` (in-flight when this snapshot was written).",
+        "VALIDATE: with d3d11 default, launch ghostty.exe. Expected: dark grey blank window — no text yet but no triangle stuck; window should resize cleanly when dragged."
+      ]
+    },
+    {
+      "id": 5,
+      "status": "completed",
+      "title": "D3D11: real Buffer impl",
+      "files": [
+        "src/renderer/d3d11/buffer.zig"
+      ],
+      "directions": [
+        "Implement `Buffer(T).init(opts, len)`: CreateBuffer with `D3D11_BUFFER_DESC{ ByteWidth = len * @sizeOf(T), Usage = DYNAMIC, BindFlags = opts.bind_flags, CPUAccessFlags = WRITE }`. Store `*ID3D11Buffer` + len + opts.",
+        "Implement `initFill(opts, data)`: same as init but with `pInitialData = &D3D11_SUBRESOURCE_DATA{ pSysMem = data.ptr }` and Usage = IMMUTABLE.",
+        "Implement `sync(data)`: Map(D3D11_MAP_WRITE_DISCARD, 0) → memcpy → Unmap. Grow buffer if data.len > capacity (release + recreate larger).",
+        "Implement `syncFromArrayLists(lists)`: total len = sum of list lens; Map; for each list memcpy in sequence; Unmap. Return total instance count.",
+        "Implement `deinit()`: Release the ID3D11Buffer.",
+        "Pattern reference: `src/renderer/opengl/buffer.zig` is the structural mirror; for the D3D11 Map/Unmap call sequence, see `src/apprt/win32/d3d11.zig::buildTrianglePipeline` end (it does CreateBuffer with initial data).",
+        "API gap: `ID3D11DeviceContext::Map` and `Unmap` are NOT yet typed in src/renderer/d3d11/api.zig — add them (they sit between PSSetShader and PSSetConstantBuffers in the vtable, see d3d11.h).",
+        "VALIDATE: with d3d11 default, the engine startup populates uniform + cell buffers; you should see no `D3D11NotYetImplemented` log spam from drawFrame."
+      ]
+    },
+    {
+      "id": 6,
+      "status": "completed",
+      "title": "D3D11: real Texture impl",
+      "files": [
+        "src/renderer/d3d11/Texture.zig"
+      ],
+      "directions": [
+        "Implement `init(opts, w, h, data)`: CreateTexture2D with `D3D11_TEXTURE2D_DESC{ Width, Height, MipLevels = 1, ArraySize = 1, Format = opts.pixel_format, SampleDesc = {1,0}, Usage = DEFAULT, BindFlags = SHADER_RESOURCE, CPUAccessFlags = {} }` and optional initial data via D3D11_SUBRESOURCE_DATA{ pSysMem = data, SysMemPitch = w * bpp }.",
+        "After CreateTexture2D, CreateShaderResourceView with NULL desc (uses texture's format).",
+        "Compute bpp from format: R8_UNORM=1, R8G8B8A8_UNORM=4, B8G8R8A8_UNORM=4.",
+        "Implement `replaceRegion(x, y, w, h, data)`: UpdateSubresource(tex, 0, &D3D11_BOX{ left=x, top=y, right=x+w, bottom=y+h, front=0, back=1 }, data.ptr, w * bpp, 0).",
+        "Implement `deinit()`: Release SRV then texture.",
+        "API gap: D3D11_BOX + UpdateSubresource + CreateShaderResourceView are not yet typed in api.zig — add the vtable entries on ID3D11Device (CreateShaderResourceView already at slot 8 as anyopaque, just type it) and on ID3D11DeviceContext (UpdateSubresource).",
+        "VALIDATE: font atlas upload should not error; glyphs should appear in the cleared frame (next phase will land actual draw calls)."
+      ]
+    },
+    {
+      "id": 7,
+      "status": "in_progress_partial",
+      "completion_note": "Phase 2 milestone landed: trivial no-op VS/PS compiled via D3DCompile, all 5 PipelineCollection slots populated, Pipeline.init + Shaders.init succeed at runtime. RenderPass.step is a no-op so nothing rasterizes — `drawFrameEnd` is the only thing the user sees (clears to #181818 + presents). Real per-shader HLSL ports are the remaining work for Phase 3.",
+      "title": "D3D11: HLSL shaders + Pipelines",
+      "files": [
+        "src/renderer/d3d11/shaders.zig",
+        "src/renderer/d3d11/Pipeline.zig",
+        "src/renderer/shaders/hlsl/* (new directory)"
+      ],
+      "directions": [
+        "Port 5 shaders from src/renderer/shaders/glsl/ to HLSL: bg_color, cell_bg, cell_text, image, bg_image. Embed via @embedFile or compile from a shaders subdirectory.",
+        "GLSL → HLSL syntax mapping: `vec4` → `float4`, `mat4` → `float4x4`, layout(binding=N) uniform → cbuffer with register(bN), layout(location=N) in/out → semantic POSITION/COLOR/etc., `texture(sampler, uv)` → `tex.Sample(samp, uv)`. Set SV_POSITION as gl_Position equivalent.",
+        "Uniforms cbuffer layout MUST exactly match `shaders.Uniforms` extern struct (already ported from metal). HLSL constant buffers have 16-byte alignment rules — same as Metal/Zig extern with align(16); should match directly.",
+        "For each shader: D3DCompile (vs_5_0 / ps_5_0) the source → get VS bytecode + PS bytecode → CreateVertexShader + CreatePixelShader + CreateInputLayout (with the bytecode for signature validation).",
+        "Build a Pipeline struct holding {vs, ps, input_layout, blend_state, raster_state}. Pre-create per-shader blend states (cell_text needs alpha blending; bg_color is opaque).",
+        "Call `d3d.loadD3DCompiler()` once in Shaders.init before any D3DCompile call.",
+        "VALIDATE: 5 pipelines compile without HLSL errors (D3DCompile error blobs are logged via `err_blob.bufferPointer`); engine startup gets past initShaders."
+      ]
+    },
+    {
+      "id": 8,
+      "status": "pending",
+      "title": "D3D11: Frame + RenderPass real impl",
+      "files": [
+        "src/renderer/d3d11/Frame.zig",
+        "src/renderer/d3d11/RenderPass.zig"
+      ],
+      "directions": [
+        "Frame.begin(opts, renderer, target): store device context ref + the offscreen target. No-op-ish — just bookkeeping.",
+        "Frame.complete(sync): no work needed beyond the swap-chain Present already in drawFrameEnd.",
+        "Frame.renderPass(attachments): construct a RenderPass that holds the target's RTV + clear color.",
+        "RenderPass.begin: OMSetRenderTargets(rtv) + ClearRenderTargetView (if clear_color set) + RSSetViewports.",
+        "RenderPass.step(step): for each step, IASetInputLayout, VSSetShader, PSSetShader, IASetVertexBuffers (step.buffers), VSSetConstantBuffers(step.uniforms), PSSetShaderResources(step.textures), DrawInstanced or Draw based on step.draw.",
+        "RenderPass.complete: no-op (state machine resets on next pass).",
+        "Generic.zig pass.step is called with a struct literal `.{ .pipeline, .uniforms, .buffers, .textures, .draw }` — accept anytype and unpack at compile-time.",
+        "VALIDATE: a full text frame draws — typed characters appear via D3D11 cell_text shader."
+      ]
+    },
+    {
+      "id": 9,
+      "status": "pending",
+      "title": "D3D11: Target offscreen FBO equivalent",
+      "files": [
+        "src/renderer/d3d11/Target.zig"
+      ],
+      "directions": [
+        "Target.init(opts): CreateTexture2D with RENDER_TARGET + SHADER_RESOURCE bind flags. Create RTV + SRV.",
+        "Target.deinit: release SRV, RTV, texture.",
+        "The renderer renders into Target's RTV, then `present(target)` blits Target → swap chain back buffer. This mirrors OpenGL's FBO → default-FB BlitFramebuffer.",
+        "VALIDATE: resize works (target gets recreated, viewport updates, no stretching)."
+      ]
+    },
+    {
+      "id": 10,
+      "status": "pending",
+      "title": "Flip default Windows backend back to .d3d11",
+      "files": [
+        "src/renderer/backend.zig"
+      ],
+      "directions": [
+        "In `Backend.default`, restore `if (target.os.tag == .windows) return .d3d11;` BEFORE the OpenGL fallback. Only do this once tasks 4-9 are working — D3D11 must render real text first.",
+        "If anything regresses, revert this line. The CLI flag `-Drenderer=opengl` provides the WGL fallback."
+      ]
+    }
+  ],
+  "validation_checklist": {
+    "opengl_baseline": [
+      "Launch ghostty.exe (Start-Process). Window opens, dark grey background.",
+      "Type ABC at the cmd prompt — exactly one of each letter appears (no duplication).",
+      "Run `dir`, output scrolls correctly.",
+      "Resize window — text reflows, no artifacts.",
+      "Ctrl+C terminates the running program but keeps the shell.",
+      "Focus loss + return → cursor blink resumes (no freeze).",
+      "Run `claude` or `k9s` — full-screen TUI renders + responds to input."
+    ],
+    "d3d11_minimum": [
+      "`zig build install -Drenderer=d3d11` succeeds.",
+      "Launch — dark grey blank window appears (Phase 2.x clear+present loop).",
+      "No `D3D11NotYetImplemented` panic; the engine drives frames at 60 FPS (title bar shows FPS).",
+      "Resize window — back buffer follows; no stuck frame.",
+      "Ctrl+C on host kills cleanly (no zombie ConPTY)."
+    ],
+    "d3d11_complete": [
+      "Text renders. Typing appears in real time.",
+      "Cursor blinks. Selection works (mouse drag highlights cells).",
+      "Scrollback works (mouse wheel).",
+      "claude / k9s / htop render correctly."
+    ]
+  },
+  "known_traps": [
+    "Cache wipe: a clean .zig-cache forces a fresh build that exposed 2 latent issues: WinMain unresolved (subsystem=Console fixed it) and d3dcompiler_47.lib missing (runtime LoadLibrary fixed it). Don't be alarmed if these resurface after another wipe — re-read Session 7 of the project memory.",
+    "Cross-drive panic: ZIG_GLOBAL_CACHE_DIR MUST be on the same drive as the build root. Setting it on C: while building from E: triggers `std.fs.path.relative` assert.",
+    "Zig 0.15 pointless-discard: `_ = surface;` in a switch arm becomes a compile error if ANOTHER arm uses `surface`. Cross-arm analysis. Solution: drop discards of function params entirely.",
+    "*const D3D11 in threadEnter: can't mutate the struct directly; use the heap-allocated SwapState pointer for any per-surface mutable state.",
+    "SetPixelFormat on HWND can only happen once. If you attach a DXGI swap chain to an HWND, a subsequent WGL SetPixelFormat will silently fail (visible as: triangle persists, GL draws nothing). The apprt-side D3D11 proof-of-life was removed for exactly this reason.",
+    "ParentWindow + Surface have a back-pointer wiring order: Surface.create must set `window.surface = self` BEFORE calling core_surface.init, because the initial resize callback fires during init and dereferences that pointer."
+  ],
+  "key_files": {
+    "src/renderer/D3D11.zig": "GraphicsAPI shim — has all ~22 methods, init creates device+factory, threadEnter creates swap chain, drawFrameEnd clears+presents.",
+    "src/renderer/d3d11/api.zig": "COM interface definitions + lazy D3DCompile loader. Add Map/Unmap/UpdateSubresource as needed.",
+    "src/renderer/d3d11/buffer.zig": "Buffer(T) — currently all stubs returning D3D11NotYetImplemented.",
+    "src/renderer/d3d11/Texture.zig": "Same — all stubs.",
+    "src/renderer/d3d11/shaders.zig": "Has the ported data structs (Uniforms, CellText, CellBg, Image, BgImage). Shaders.init still returns NotYetImplemented.",
+    "src/renderer/d3d11/Pipeline.zig": "Skeleton — init returns NotYetImplemented.",
+    "src/renderer/d3d11/Frame.zig": "Skeleton — begin returns NotYetImplemented but complete/renderPass have callable stubs.",
+    "src/renderer/d3d11/RenderPass.zig": "step + complete are no-op stubs (callable, do nothing).",
+    "src/renderer/d3d11/Target.zig": "Skeleton — init returns NotYetImplemented.",
+    "src/renderer/backend.zig": "Default Windows backend currently .opengl; flip to .d3d11 once tasks 4-9 are done.",
+    "src/build/SharedDeps.zig::addWin32": "Links kernel32+user32+gdi32+opengl32+d3d11+dxgi. d3dcompiler is intentionally NOT linked (runtime-loaded).",
+    "src/build/GhosttyExe.zig": "Sets subsystem=Console + adds ghostty.rc for the icon.",
+    "src/main_ghostty.zig": "Calls FreeConsole() at startup so the inherited console window detaches.",
+    "src/apprt/win32/d3d11.zig": "Apprt-side triangle proof-of-life. Still on disk for reference; no longer called from Surface.create.",
+    "src/apprt/win32/Surface.zig": "Owns Window + WGL Context + CoreSurface."
+  },
+  "memory_pointer": "C:\\Users\\mihai.lazar\\.claude\\projects\\E--\\memory\\project_ghostty_windows_port.md (Session 7 has the relevant delta)"
+}

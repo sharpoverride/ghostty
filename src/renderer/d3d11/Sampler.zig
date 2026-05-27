@@ -1,8 +1,10 @@
-//! D3D11 sampler wrapper (skeleton).
+//! D3D11 sampler.
 const Self = @This();
 
 const std = @import("std");
 const d3d = @import("api.zig");
+
+const log = std.log.scoped(.d3d11);
 
 pub const Options = struct {
     device: *d3d.ID3D11Device,
@@ -14,10 +16,21 @@ pub const Options = struct {
 sampler: *d3d.ID3D11SamplerState,
 
 pub fn init(opts: Options) !Self {
-    _ = opts;
-    return error.D3D11NotYetImplemented;
+    const desc: d3d.D3D11_SAMPLER_DESC = .{
+        .Filter = opts.filter,
+        .AddressU = opts.address_u,
+        .AddressV = opts.address_v,
+        .AddressW = .CLAMP,
+    };
+    var samp: ?*d3d.ID3D11SamplerState = null;
+    const hr = opts.device.vtable.CreateSamplerState(opts.device, &desc, &samp);
+    if (d3d.failed(hr)) {
+        log.err("CreateSamplerState failed: 0x{X:0>8}", .{@as(u32, @bitCast(hr))});
+        return error.CreateSamplerStateFailed;
+    }
+    return .{ .sampler = samp.? };
 }
 
 pub fn deinit(self: Self) void {
-    _ = self;
+    _ = self.sampler.release();
 }

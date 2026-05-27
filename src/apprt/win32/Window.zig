@@ -16,6 +16,18 @@ const apprt = @import("../../apprt.zig");
 const termio = @import("../../termio.zig");
 const terminal = @import("../../terminal/main.zig");
 const OpenGL = @import("../../renderer/OpenGL.zig");
+const D3D11 = @import("../../renderer/D3D11.zig");
+const build_config = @import("../../build_config.zig");
+
+/// Read the active renderer backend's FPS counter. Both OpenGL and
+/// D3D11 publish an atomic via `currentFps()`; the backend is chosen at
+/// build time.
+fn currentBackendFps() u32 {
+    return switch (build_config.renderer) {
+        .d3d11 => D3D11.currentFps(),
+        else => OpenGL.currentFps(),
+    };
+}
 const Surface = @import("Surface.zig");
 
 const HANDLE = windows.HANDLE;
@@ -186,6 +198,8 @@ const TEXTMETRICW = extern struct {
 };
 
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?LPCWSTR) callconv(.winapi) HMODULE;
+extern "winmm" fn timeBeginPeriod(uPeriod: c_uint) callconv(.winapi) c_uint;
+extern "winmm" fn timeEndPeriod(uPeriod: c_uint) callconv(.winapi) c_uint;
 extern "user32" fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) callconv(.winapi) ATOM;
 extern "user32" fn CreateWindowExW(
     dwExStyle: DWORD,
@@ -301,6 +315,11 @@ heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 /// into a single visible frame — what reads as "bulky" typing.
 refresh_thread: ?std.Thread = null,
 refresh_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+/// Set true by Surface.create once core_surface.init has finished and the
+/// renderer thread exists. The refresh loop must not touch
+/// core_surface.renderer_thread before this — it's spawned in
+/// Window.create, which runs before core_surface.init.
+render_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 /// Adapter thread: drains engine-bound events (keys, focus, size, mouse,
 /// scroll) and calls into CoreSurface callbacks. CoreSurface's callbacks
@@ -503,13 +522,19 @@ pub fn create(alloc: Allocator, parent_hwnd: HWND) !*Self {
         break :blk null;
     };
 
-    // (Forced refresh thread temporarily disabled — was running drawFrame
-    // at 60fps unconditionally and contending with io_thread for CPU +
-    // the engine's renderer_state mutex, which made typing feedback
-    // arrive in bursts. Local echo gives us instant visual feedback for
-    // typed chars; the engine's own renderer_wakeup notifies on pty
-    // output handles the rest.)
-    _ = refreshLoop; // keep symbol live for the deinit cleanup path
+    // Forced refresh thread. The renderer's xev loop on Windows goes
+    // dormant after the initial frames — its blink/draw timers stop
+    // firing and a one-shot wakeup.notify() doesn't reliably re-wake it
+    // (IOCP async re-arm race). A *continuous* wakeup.notify() overcomes
+    // this. We use `wakeup` (not draw_now) so each tick runs the full
+    // renderCallback → updateFrame, which re-reads the terminal and
+    // picks up typed input + shell output. Non-dirty frames are cheap
+    // (updateFrame skips the cell rebuild), so this doesn't meaningfully
+    // contend with the io reader.
+    self.refresh_thread = std.Thread.spawn(.{}, refreshLoop, .{self}) catch |e| blk: {
+        log.warn("refresh thread spawn failed: {}", .{e});
+        break :blk null;
+    };
 
     // Spin up the engine adapter thread. UI thread enqueues events here
     // and returns; this thread drains the queue and calls into CoreSurface
@@ -532,16 +557,20 @@ fn heartbeatLoop(self: *Self) void {
 }
 
 fn refreshLoop(self: *Self) void {
-    // Wake the renderer every ~16ms (≈60fps) so each new pty byte that
-    // arrives shows up in the very next frame instead of waiting for
-    // the engine's lazy redraw heuristic. The renderer's drawFrame(sync=
-    // true) path bypasses the dirty-state gate so we get real frames.
-    const interval_ns: u64 = 16 * std.time.ns_per_ms;
-    while (!self.refresh_stop.load(.seq_cst)) {
-        std.Thread.sleep(interval_ns);
-        const surface = self.surface orelse continue;
-        surface.core_surface.renderer_thread.draw_now.notify() catch {};
-    }
+    _ = self;
+    // Raise the system timer resolution to 1ms (process-wide) so the
+    // renderer thread's 8ms draw timer is accurate instead of being
+    // rounded up to the default ~15.6ms granularity (which would cap us
+    // at ~64fps). We intentionally do NOT call timeEndPeriod — the
+    // higher resolution should persist for the app's lifetime.
+    //
+    // Rendering itself is driven by the renderer thread's own always-on
+    // draw timer (renderer/Thread.zig syncDrawTimer, forced active for
+    // the win32/D3D11 build): the cross-thread xev wakeup is unreliable
+    // on Windows, but the renderer thread's own xev timer fires reliably,
+    // giving a self-sustaining frame clock that re-reads the terminal
+    // each tick and renders typed input + shell output.
+    _ = timeBeginPeriod(1);
 }
 
 /// Format the KEY_EVENT_RECORD-style escape sequence used by conhost /
@@ -665,31 +694,12 @@ fn engineLoop(self: *Self) void {
                     break :blk term.modes.get(.win32_input_mode);
                 };
 
-                // Predictive local echo. Conhost auto-enables Win32 input
-                // mode (DEC 9001) for any ConPTY-spawned program — including
-                // plain cmd / pwsh — so `win32_mode` is a poor gate here.
-                // Instead skip only when the program has switched to the
-                // ALT SCREEN (TUIs like claude / vim / htop / k9s). Plain
-                // shell prompts (cmd / pwsh / bash) stay on the main screen,
-                // and their echoed char always lands at the current cursor
-                // position — exactly where our prediction wrote it.
-                const alt_screen = blk2: {
-                    surface.core_surface.renderer_state.mutex.lock();
-                    defer surface.core_surface.renderer_state.mutex.unlock();
-                    break :blk2 term.screens.active_key == .alternate;
-                };
-                if (!alt_screen and
-                    k.action == .press and
-                    !k.mods.ctrl and !k.mods.alt and
-                    k.utf8_len == 1 and
-                    k.utf8_buf[0] >= 0x20 and k.utf8_buf[0] <= 0x7E)
-                {
-                    const cp: u21 = k.utf8_buf[0];
-                    surface.core_surface.renderer_state.mutex.lock();
-                    surface.core_surface.io.terminal.print(cp) catch {};
-                    surface.core_surface.renderer_state.mutex.unlock();
-                    surface.core_surface.renderer_thread.draw_now.notify() catch {};
-                }
+                // (No local echo: the shell echoes typed characters back
+                // through the pty and the renderer now displays that
+                // promptly, so a local prediction would just double-print.
+                // If we later want zero-latency feedback we'd need a proper
+                // tentative overlay that reconciles against the pty echo.)
+
                 // Log transitions so we can correlate freezes / weird key
                 // behavior against whether the program opted into 9001.
                 if (win32_mode != self.win32_mode_last) {
@@ -916,7 +926,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                     const title = std.fmt.bufPrint(
                         &buf,
                         "Ghostty - FPS={d}",
-                        .{OpenGL.currentFps()},
+                        .{currentBackendFps()},
                     ) catch return 0;
                     p.setTitle(title) catch {};
                 };

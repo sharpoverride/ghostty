@@ -9,6 +9,7 @@ const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const rendererpkg = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
+const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
 const App = @import("../App.zig");
@@ -50,6 +51,13 @@ wakeup_c: xev.Completion = .{},
 /// This can be used to stop the renderer on the next loop iteration.
 stop: xev.Async,
 stop_c: xev.Completion = .{},
+
+/// Non-xev quit flag for the win32 manual render loop. The xev stop
+/// async isn't reliably delivered on Windows (same IOCP issue as the
+/// wakeup), so the manual loop also polls this flag. Set it directly
+/// (no xev) from the apprt teardown path so the renderer thread exits
+/// and `join()` doesn't hang on close.
+quit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 /// The timer used for rendering
 render_h: xev.Timer,
@@ -259,7 +267,38 @@ fn threadMain_(self: *Thread) !void {
     // Run
     log.debug("starting renderer thread", .{});
     defer log.debug("starting renderer thread shutdown", .{});
-    _ = try self.loop.run(.until_done);
+
+    if (comptime win32_render_loop) {
+        // On Windows the blocking IOCP wait (`run(.until_done)`) stops
+        // waking after startup — async notifies and timers no longer
+        // dequeue, freezing the renderer. Instead we drive the loop
+        // manually: each tick we process any pending xev completions
+        // WITHOUT blocking (`.no_wait`), drain the mailbox ourselves,
+        // then render a frame and sleep. This gives a deterministic
+        // ~120fps frame clock that re-reads the terminal every tick, so
+        // typed input + shell output always render. stopCallback calls
+        // loop.stop() → loop.done() becomes true → we exit.
+        const frame_ns: u64 = 8 * std.time.ns_per_ms;
+        while (!self.loop.done() and !self.quit.load(.seq_cst)) {
+            // Process any pending xev completions WITHOUT blocking (the
+            // blocking wait is what wedges on Windows), drain the mailbox,
+            // then render a frame and sleep to pace ~120fps.
+            self.loop.run(.no_wait) catch |err|
+                log.warn("renderer loop tick err={}", .{err});
+            self.drainMailbox() catch |err|
+                log.warn("error draining mailbox err={}", .{err});
+            if (self.flags.visible) {
+                self.renderer.updateFrame(
+                    self.state,
+                    self.flags.cursor_blink_visible,
+                ) catch |err| log.warn("updateFrame err={}", .{err});
+                self.drawFrame(false);
+            }
+            std.Thread.sleep(frame_ns);
+        }
+    } else {
+        _ = try self.loop.run(.until_done);
+    }
 }
 
 fn setQosClass(self: *const Thread) void {
@@ -291,6 +330,13 @@ fn setQosClass(self: *const Thread) void {
         log.warn("error setting QoS class err={}", .{err});
     }
 }
+
+/// On the win32 build the renderer thread's xev loop is driven by a
+/// manual non-blocking loop (see threadMain_) instead of the blocking
+/// `loop.run(.until_done)`, because IOCP async notifies / timers stop
+/// waking the blocking wait after startup. Draws are issued from that
+/// manual loop directly.
+const win32_render_loop = build_config.app_runtime == .win32;
 
 fn syncDrawTimer(self: *Thread) void {
     skip: {
@@ -694,6 +740,7 @@ fn stopCallback(
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     _ = r catch unreachable;
+    self_.?.quit.store(true, .seq_cst);
     self_.?.loop.stop();
     return .disarm;
 }

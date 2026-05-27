@@ -49,7 +49,14 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     // OS-specific
     switch (cfg.target.result.os.tag) {
         .windows => {
-            exe.subsystem = .Windows;
+            // Console subsystem links the standard C `mainCRTStartup`,
+            // which calls `main` — which Zig's std-startup exports for
+            // us when libc is linked. The Windows subsystem would
+            // require WinMain / wWinMain, but the libc-linked `main`
+            // path in std/start.zig short-circuits before the wWinMain
+            // export branch is reached. We hide the console window at
+            // runtime via `FreeConsole` in `main_ghostty`.
+            exe.subsystem = .Console;
             exe.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
             });

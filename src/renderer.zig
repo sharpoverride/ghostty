@@ -40,11 +40,7 @@ pub const Renderer = switch (build_config.renderer) {
     .metal => GenericRenderer(Metal),
     .opengl => GenericRenderer(OpenGL),
     .webgl => WebGL,
-    // STUB: D3D11 backend not yet implemented. Falls through to OpenGL so the
-    // build stays linkable. The win32 apprt currently bypasses the renderer
-    // entirely for ConPTY-echo bring-up. Replace with GenericRenderer(D3D11)
-    // when the D3D11 GraphicsAPI shim is fleshed out.
-    .d3d11 => GenericRenderer(OpenGL),
+    .d3d11 => GenericRenderer(D3D11),
 };
 
 /// The health status of a renderer. These must be shared across all

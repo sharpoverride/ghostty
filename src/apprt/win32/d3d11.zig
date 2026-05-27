@@ -288,10 +288,13 @@ const TrianglePipeline = struct {
 };
 
 fn buildTrianglePipeline(device: *d3d.ID3D11Device) !TrianglePipeline {
+    if (!d3d.loadD3DCompiler()) return error.D3DCompilerNotAvailable;
+    const compile = d3d.D3DCompile.?;
+
     // 1. Compile vertex shader.
     var vs_blob: ?*d3d.ID3DBlob = null;
     var err_blob: ?*d3d.ID3DBlob = null;
-    var hr = d3d.D3DCompile(
+    var hr = compile(
         triangle_hlsl.ptr,
         triangle_hlsl.len,
         null,
@@ -317,7 +320,7 @@ fn buildTrianglePipeline(device: *d3d.ID3D11Device) !TrianglePipeline {
     // 2. Compile pixel shader.
     var ps_blob: ?*d3d.ID3DBlob = null;
     err_blob = null;
-    hr = d3d.D3DCompile(
+    hr = compile(
         triangle_hlsl.ptr,
         triangle_hlsl.len,
         null,

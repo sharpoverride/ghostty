@@ -18,7 +18,6 @@ const CoreSurface = @import("../../Surface.zig");
 const ApprtApp = @import("App.zig");
 const Window = @import("Window.zig");
 const gl = @import("gl.zig");
-const d3d11 = @import("d3d11.zig");
 const clipboard = @import("clipboard.zig");
 
 const log = std.log.scoped(.win32_surface);
@@ -46,33 +45,18 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
     const window = try Window.create(alloc, @ptrCast(parent_hwnd));
     errdefer window.deinit();
 
-    // D3D11 proof-of-life: build the COM stack, drive a short color-cycle
-    // animation, then tear down. Verifies not just one-shot clear+present
-    // but a sustained render loop on the swap chain. WGL takes over the
-    // HDC afterward — Phase 2 will replace WGL with D3D11 outright once
-    // the GraphicsAPI surface is implemented.
-    if (d3d11.Context.init(window.hwnd)) |d3d_ctx| {
-        var ctx_mut = d3d_ctx;
-        // ~2s color cycle through blue → magenta → cyan, ~60fps.
-        const frames: u32 = 120;
-        var i: u32 = 0;
-        while (i < frames) : (i += 1) {
-            const t: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(frames));
-            const r: f32 = 0.5 + 0.5 * @sin(t * std.math.pi * 2.0);
-            const g: f32 = 0.3 + 0.3 * @sin(t * std.math.pi * 2.0 + 2.0);
-            const b: f32 = 0.7 + 0.3 * @cos(t * std.math.pi * 2.0);
-            ctx_mut.clearAndPresent(.{ r, g, b, 1.0 });
-            std.Thread.sleep(16 * std.time.ns_per_ms);
-        }
-        ctx_mut.deinit();
-        log.info("D3D11 proof-of-life: color cycle complete, tearing down", .{});
-    } else |e| {
-        log.warn("D3D11 proof-of-life FAILED: {}", .{e});
-    }
-
     // WGL context: must succeed for the renderer thread to attach. If we
     // can't get a 4.3 core context we abort surface creation — there's no
     // graceful fallback once CoreSurface starts the renderer thread.
+    //
+    // NOTE: the D3D11 swap-chain proof-of-life used to run here for ~2s
+    // before WGL took over. It was removed once it became clear that
+    // attaching a DXGI swap chain to the HWND first stops the subsequent
+    // `SetPixelFormat` from being honoured by WGL — the on-screen output
+    // sticks at the triangle instead of falling through to the GL
+    // renderer. The proof code still lives in `apprt/win32/d3d11.zig`
+    // for reference and is what `Phase 2` of the D3D11 backend will
+    // hoist out of apprt-land entirely.
     const gl_ctx = try gl.Context.init(window.hwnd);
     // Drop currency on the UI thread so the renderer thread (started by
     // CoreSurface) can take ownership cleanly.
@@ -126,10 +110,20 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
     // pty.WindowsPty + ConPTY).
     try self.core_surface.init(alloc, &self.config, app.core_app, app, self);
 
+    // core_surface (and its renderer_thread) is now live — let the
+    // forced-refresh thread start signaling draws.
+    window.render_ready.store(true, .seq_cst);
+
     return self;
 }
 
 pub fn deinit(self: *Self) void {
+    // Signal the renderer thread's manual loop to exit BEFORE
+    // core_surface.deinit (which joins that thread). The xev stop async
+    // isn't reliably delivered on Windows, so without this non-xev flag
+    // the join would hang — that's the close-button freeze.
+    self.core_surface.renderer_thread.quit.store(true, .seq_cst);
+
     log.info("Surface.deinit: core_surface.deinit start", .{});
     self.core_surface.deinit();
     log.info("Surface.deinit: core_surface.deinit returned", .{});

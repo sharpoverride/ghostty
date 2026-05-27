@@ -19,6 +19,9 @@ pub const Backend = enum {
         }
 
         if (target.os.tag.isDarwin()) return .metal;
+        // Windows: D3D11 is the default renderer (text, input, cursor,
+        // per-cell backgrounds all working). Opt into the OpenGL/WGL
+        // path with `-Drenderer=opengl` if needed.
         if (target.os.tag == .windows) return .d3d11;
         return .opengl;
     }

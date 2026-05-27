@@ -770,7 +770,10 @@ fn addWin32(
     step.linkSystemLibrary2("opengl32", .{});
     step.linkSystemLibrary2("d3d11", .{});
     step.linkSystemLibrary2("dxgi", .{});
-    step.linkSystemLibrary2("d3dcompiler_47", .{});
+    step.linkSystemLibrary2("winmm", .{}); // timeBeginPeriod for 120fps refresh
+    // d3dcompiler_47 is loaded at runtime via LoadLibrary (see
+    // `renderer/d3d11/api.zig::loadD3DCompiler`). Linking the import lib
+    // statically pulls libcmt.lib which expects a WinMain entry point.
 }
 
 /// Add only the dependencies required for `Config.simd` enabled. This also
