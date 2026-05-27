@@ -141,6 +141,10 @@ const WM_APP: UINT = 0x8000;
 /// lparam = pointer (cast) to a c-allocator-owned UTF-16 buffer. The
 /// WndProc takes ownership and frees.
 const WM_APP_SET_TITLE: UINT = WM_APP + 1;
+/// Posted by a Surface (possibly from a non-UI thread, e.g. on child-process
+/// exit) to request that its tab be closed on the UI thread. wparam carries
+/// the *Surface pointer.
+const WM_APP_CLOSE_SURFACE: UINT = WM_APP + 2;
 
 const SWP_NOZORDER: UINT = 0x0004;
 const SWP_NOACTIVATE: UINT = 0x0010;
@@ -336,6 +340,14 @@ pub fn setTitle(self: *const Self, title: []const u8) !void {
     }
 }
 
+/// Request that the tab hosting `surface` be closed. Thread-safe: posts to
+/// the UI thread, which finds the tab and tears it down (tab teardown joins
+/// the renderer/IO threads and must not run on those threads). Used by
+/// `Surface.close()` when the child shell exits.
+pub fn requestCloseSurface(self: *const Self, surface: *Surface) void {
+    _ = PostMessageW(self.hwnd, WM_APP_CLOSE_SURFACE, @intFromPtr(surface), 0);
+}
+
 /// Cycle to the next (offset=+1) or previous (offset=-1) tab.
 pub fn cycleTab(self: *Self, offset: i32) void {
     if (self.tabs.items.len < 2) return;
@@ -438,6 +450,24 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 const ptr: [*]u16 = @ptrFromInt(ptr_int);
                 _ = SetWindowTextW(hwnd, @ptrCast(ptr));
                 std.heap.c_allocator.free(ptr[0..len]);
+            }
+            return 0;
+        },
+        WM_APP_CLOSE_SURFACE => {
+            // A surface asked to close (typically its shell exited). Find the
+            // matching tab and close it; closeTab tears down the window if it
+            // was the last tab.
+            const ptr_int: usize = @intCast(wparam);
+            if (ptr_int != 0) {
+                if (recoverSelf(hwnd)) |self| {
+                    const surface: *Surface = @ptrFromInt(ptr_int);
+                    for (self.tabs.items, 0..) |s, i| {
+                        if (s == surface) {
+                            self.closeTab(i);
+                            break;
+                        }
+                    }
+                }
             }
             return 0;
         },

@@ -77,6 +77,9 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
     // `--copy-on-select=false` or a config file.
     config.@"copy-on-select" = .true;
     config.@"right-click-action" = .@"copy-or-paste";
+    // NOTE: ctrl+v → paste is handled directly in Window.zig's forwardKey
+    // (not as a config keybind) so it works even when the app enables Win32
+    // input mode, which bypasses keyCallback and the keybind system.
 
     // Parse the process command line. Supports the standard Ghostty CLI:
     //   ghostty.exe --command="pwsh.exe -NoLogo"
@@ -169,8 +172,14 @@ pub fn rtApp(self: *Self) *ApprtApp {
 }
 
 pub fn close(self: *Self, process_active: bool) void {
-    _ = self;
     _ = process_active;
+    // The engine calls this when the surface should close — notably when the
+    // child shell exits (e.g. PowerShell `exit`). This can run on the
+    // renderer/IO thread, so we marshal the actual teardown to the UI thread
+    // via the parent window (tab teardown joins those very threads).
+    if (self.app.parent) |parent| {
+        parent.requestCloseSurface(self);
+    }
 }
 
 pub fn getTitle(self: *Self) ?[:0]const u8 {

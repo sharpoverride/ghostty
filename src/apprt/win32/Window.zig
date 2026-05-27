@@ -632,7 +632,9 @@ fn sendWin32InputRecord(surface: *Surface, k: QueuedKey) void {
     if (k.mods.ctrl and !k.mods.alt and k.vk >= 0x41 and k.vk <= 0x5A) {
         uchar = k.vk & 0x1F;
     } else if (k.vk == 0x0D) {
-        uchar = if (k.mods.ctrl) 0x0A else 0x0D;
+        // Ctrl+Enter AND Shift+Enter both send LF (0x0A) so TUIs like Claude
+        // insert a newline instead of submitting; plain Enter stays CR.
+        uchar = if (k.mods.ctrl or k.mods.shift) 0x0A else 0x0D;
     } else if (k.vk == 0x09) {
         uchar = 0x09;
     } else if (k.vk == 0x08) {
@@ -659,6 +661,13 @@ fn sendWin32InputRecord(surface: *Surface, k: QueuedKey) void {
         } else |_| {
             uchar = first;
         }
+    }
+
+    // Alt+<printable> (no ctrl): we skip utf8 for Alt combos, but conhost
+    // still reports the base character in uChar. Fall back to the unshifted
+    // codepoint so the record carries 'v' for Alt+V instead of a null char.
+    if (uchar == 0 and k.mods.alt and !k.mods.ctrl and k.unshifted_codepoint >= 0x20) {
+        uchar = k.unshifted_codepoint;
     }
 
     var buf: [38]u8 = undefined;
@@ -724,12 +733,11 @@ fn engineLoop(self: *Self) void {
                     // .utf8 with the PC-style \r sequence for Enter.
                     var override_key = false;
                     if (kk.action == .press and kk.key == .enter) {
-                        if (kk.mods.shift) {
-                            kk.utf8_buf[0] = 0x1B; // ESC + CR
-                            kk.utf8_buf[1] = 0x0D;
-                            kk.utf8_len = 2;
-                            override_key = true;
-                        } else if (kk.mods.ctrl) {
+                        if (kk.mods.shift or kk.mods.ctrl) {
+                            // Shift+Enter and Ctrl+Enter both send LF so TUIs
+                            // (Claude, multi-line REPLs) insert a newline
+                            // rather than submit. Matches Windows Terminal's
+                            // behavior for shift+enter.
                             kk.utf8_buf[0] = 0x0A; // LF
                             kk.utf8_len = 1;
                             override_key = true;
@@ -882,10 +890,20 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
     switch (msg) {
         // WM_KEYDOWN handles EVERYTHING: text + special keys + modifiers.
         // WM_CHAR is suppressed below so we don't get double input.
-        WM_KEYDOWN, WM_SYSKEYDOWN => {
+        WM_KEYDOWN => {
             forwardKey(hwnd, wparam, lparam, .press);
-            // Fall through to DefWindowProcW so system keys (Alt+F4 etc.)
-            // still work even if we forwarded them.
+            // Fall through to DefWindowProcW (harmless for normal keys).
+        },
+        WM_SYSKEYDOWN => {
+            forwardKey(hwnd, wparam, lparam, .press);
+            // Alt+<key> arrives here. Suppress the default Alt-mnemonic
+            // menu handling (which beeps and swallows combos like Alt+V)
+            // by NOT deferring to DefWindowProcW — the engine already got
+            // the key above. EXCEPTION: let genuine system combos through
+            // so the OS still handles them: Alt+F4 (close), Alt+Space
+            // (system menu).
+            if (wparam != 0x73 and wparam != 0x20) return 0; // VK_F4, VK_SPACE
+            // else fall through to DefWindowProcW.
         },
         WM_KEYUP, WM_SYSKEYUP => forwardKey(hwnd, wparam, lparam, .release),
         // Eat WM_CHAR — we already handled the press via WM_KEYDOWN with
@@ -1189,6 +1207,19 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
                 return;
             }
         }
+
+        // Ctrl+V → paste. Handled here rather than via a config keybind so
+        // it works even when the app enabled Win32 input mode (which bypasses
+        // keyCallback + the keybind system). performBindingAction reads the
+        // OS clipboard and writes a (bracketed) paste to the pty — which is
+        // what TUIs like Claude Code expect, since they don't read the
+        // clipboard themselves.
+        if (!mods.shift and vk == 0x56) {
+            _ = surface.core_surface.performBindingAction(
+                .{ .paste_from_clipboard = {} },
+            ) catch |e| log.warn("ctrl+v paste failed: {}", .{e});
+            return;
+        }
     }
 
     // NOTE: we deliberately do NOT promote press→repeat for held keys.
@@ -1220,6 +1251,12 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
     const unshifted: u21 = blk: {
         const ch: u32 = mapped & 0x7FFF_FFFF; // strip dead-key bit
         if (ch == 0 or ch > 0x10_FFFF) break :blk 0;
+        // MapVirtualKeyW returns the UPPERCASE letter for A-Z VKs, but
+        // Ghostty expects the unshifted (lowercase) base codepoint: unicode
+        // keybinds match lowercase ('c'/'v', not 'C'/'V'), and the alt-as-ESC
+        // prefix uses this — so alt+v must yield ESC v, not ESC V, or TUIs
+        // like Claude won't recognize the combo.
+        if (ch >= 'A' and ch <= 'Z') break :blk @intCast(ch + 32);
         break :blk @intCast(ch);
     };
 
