@@ -184,7 +184,17 @@ extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.winapi) BOOL;
 extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
 extern "gdi32" fn SetTextColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLORREF;
 extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
-const DEFAULT_GUI_FONT: i32 = 17;
+extern "gdi32" fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, w: i32, h: i32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn FillRgn(hdc: HDC, hrgn: ?*anyopaque, hbr: HBRUSH) callconv(.winapi) BOOL;
+extern "gdi32" fn CreateFontW(
+    nHeight: i32, nWidth: i32, nEscapement: i32, nOrientation: i32,
+    fnWeight: i32, fdwItalic: DWORD, fdwUnderline: DWORD, fdwStrikeOut: DWORD,
+    fdwCharSet: DWORD, fdwOutputPrecision: DWORD, fdwClipPrecision: DWORD,
+    fdwQuality: DWORD, fdwPitchAndFamily: DWORD, lpszFace: [*:0]const u16,
+) callconv(.winapi) ?*anyopaque;
+const FW_NORMAL: i32 = 400;
+const DEFAULT_CHARSET: DWORD = 1;
+const CLEARTYPE_QUALITY: DWORD = 5;
 
 // Tab strip geometry (logical px at 96 DPI; scaled by DPI at runtime).
 const tab_strip_base: i32 = 32;
@@ -196,6 +206,20 @@ const tab_close_w: i32 = 24;
 // ---------------------------------------------------------------------------
 // Public API.
 // ---------------------------------------------------------------------------
+
+/// (Re)create the cached Segoe UI font sized for the window's current DPI.
+fn ensureTabFont(self: *Self) void {
+    if (self.tab_font) |f| _ = DeleteObject(f);
+    const dpi: i32 = @intCast(GetDpiForWindow(self.hwnd));
+    // Negative height = character height (vs cell height); 12px @ 96 DPI.
+    const h = -@divTrunc(12 * dpi, 96);
+    const face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
+    self.tab_font = CreateFontW(
+        h, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
+        face,
+    );
+}
 
 /// Height of the tab strip at the top of the client area, DPI-scaled.
 /// The active surface child is laid out below this band; the band itself is
@@ -214,6 +238,8 @@ hwnd: HWND,
 /// switching.
 tabs: std.array_list.Managed(*Surface),
 active: usize = 0,
+/// Cached Segoe UI font for the tab strip. Recreated on DPI change.
+tab_font: ?*anyopaque = null,
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWin32Parent");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -261,6 +287,7 @@ pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
         @ptrCast(self),
     ) orelse return error.CreateParentWindowFailed;
     self.hwnd = hwnd;
+    self.ensureTabFont();
 
     _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @intCast(@intFromPtr(self)));
     _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -279,6 +306,7 @@ pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
 
 pub fn deinit(self: *Self) void {
     _ = KillTimer(self.hwnd, AUTOHEAL_TIMER_ID);
+    if (self.tab_font) |f| _ = DeleteObject(f);
     for (self.tabs.items) |s| s.deinit();
     self.tabs.deinit();
     self.alloc.destroy(self);
@@ -469,27 +497,38 @@ fn tabWidth(width: i32, n: i32) i32 {
 /// Paint the tab strip. Called from WM_PAINT.
 fn paintTabStrip(self: *Self, hdc: HDC, width: i32) void {
     const strip = self.stripHeight();
+    const dpi: i32 = @intCast(GetDpiForWindow(self.hwnd));
+    const radius = @max(6, @divTrunc(10 * dpi, 96));
+    const pad_top = @max(3, @divTrunc(4 * dpi, 96));
 
     // Strip background.
-    const bg = CreateSolidBrush(0x002b2b2b);
+    const strip_bg = CreateSolidBrush(0x002b2b2b);
     var full: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = strip };
-    _ = FillRect(hdc, &full, bg);
-    _ = DeleteObject(bg);
+    _ = FillRect(hdc, &full, strip_bg);
+    _ = DeleteObject(strip_bg);
 
-    _ = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    // Use the cached Segoe UI font; transparent text background.
+    if (self.tab_font) |f| _ = SelectObject(hdc, f);
     _ = SetBkMode(hdc, TRANSPARENT);
 
     const n: i32 = @intCast(self.tabs.items.len);
     const tw = tabWidth(width, n);
 
+    // Tabs: rounded-rect background per tab, then title + close glyph.
+    // Extending the bottom past the visible strip makes the lower corners
+    // square-looking (clipped at the band) while the top stays rounded —
+    // the modern terminal-tab look.
     var i: i32 = 0;
     while (i < n) : (i += 1) {
         const x = i * tw;
         const active = (@as(usize, @intCast(i)) == self.active);
 
         const tab_bg = CreateSolidBrush(if (active) 0x00181818 else 0x00333333);
-        var tr: RECT = .{ .left = x + 1, .top = 3, .right = x + tw - 1, .bottom = strip };
-        _ = FillRect(hdc, &tr, tab_bg);
+        const rgn = CreateRoundRectRgn(x + 1, pad_top, x + tw - 1, strip + radius, radius * 2, radius * 2);
+        if (rgn) |r| {
+            _ = FillRgn(hdc, r, tab_bg);
+            _ = DeleteObject(r);
+        }
         _ = DeleteObject(tab_bg);
 
         // Title (index-based label until per-tab titles are wired).
@@ -498,20 +537,20 @@ fn paintTabStrip(self: *Self, hdc: HDC, width: i32) void {
         var w16: [48]u16 = undefined;
         const wlen = std.unicode.utf8ToUtf16Le(&w16, label) catch 0;
         _ = SetTextColor(hdc, if (active) 0x00ffffff else 0x00aaaaaa);
-        var lr: RECT = .{ .left = x + 10, .top = 3, .right = x + tw - tab_close_w, .bottom = strip };
+        var lr: RECT = .{ .left = x + 14, .top = pad_top, .right = x + tw - tab_close_w, .bottom = strip };
         _ = DrawTextW(hdc, &w16, @intCast(wlen), &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         // Close "x".
-        _ = SetTextColor(hdc, 0x00cccccc);
-        var cr: RECT = .{ .left = x + tw - tab_close_w, .top = 3, .right = x + tw - 2, .bottom = strip };
-        const x_glyph = [_]u16{'x'};
+        _ = SetTextColor(hdc, if (active) 0x00cccccc else 0x00888888);
+        var cr: RECT = .{ .left = x + tw - tab_close_w, .top = pad_top, .right = x + tw - 4, .bottom = strip };
+        const x_glyph = [_]u16{ 0x00D7 }; // U+00D7 MULTIPLICATION SIGN — crisper than 'x'
         _ = DrawTextW(hdc, &x_glyph, 1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     // New-tab "+" button.
     const bx = n * tw;
     _ = SetTextColor(hdc, 0x00cccccc);
-    var pr: RECT = .{ .left = bx, .top = 3, .right = bx + new_btn_w, .bottom = strip };
+    var pr: RECT = .{ .left = bx, .top = pad_top, .right = bx + new_btn_w, .bottom = strip };
     const plus = [_]u16{'+'};
     _ = DrawTextW(hdc, &plus, 1, &pr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
@@ -612,6 +651,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 suggested.bottom - suggested.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            // Re-create the tab strip font for the new DPI.
+            if (recoverSelf(hwnd)) |self| self.ensureTabFont();
             return 0;
         },
         WM_TIMER => {
