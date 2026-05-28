@@ -932,23 +932,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_APP_HEARTBEAT => {
-            // Watchdog tick — also publishes the most recent FPS sample
-            // to the title bar so it's always visible without tailing the
-            // log. Title must be set on the top-level parent HWND (the
-            // visible chrome); SetWindowTextW on our child changes only
-            // the invisible child window text.
+            // Watchdog tick — still useful to confirm the UI pump is alive
+            // when tailing the log. Used to also publish the FPS in the
+            // title bar; removed once tab titles became user-meaningful so
+            // the heartbeat doesn't fight the actual title.
             log.debug("heartbeat seq={d}", .{wparam});
-            if (recoverSelf(hwnd)) |self| {
-                if (self.surface) |s| if (s.app.parent) |p| {
-                    var buf: [64]u8 = undefined;
-                    const title = std.fmt.bufPrint(
-                        &buf,
-                        "Ghostty - FPS={d}",
-                        .{currentBackendFps()},
-                    ) catch return 0;
-                    p.setTitle(title) catch {};
-                };
-            }
             return 0;
         },
         WM_SIZE => forwardSize(hwnd, lparam),
