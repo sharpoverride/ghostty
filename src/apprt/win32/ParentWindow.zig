@@ -149,6 +149,11 @@ const WM_APP_CLOSE_SURFACE: UINT = WM_APP + 2;
 /// from another thread) to drain the core app mailbox on the UI thread. This
 /// is how surface messages like child_exited actually get handled.
 const WM_APP_TICK: UINT = WM_APP + 3;
+/// Posted to set a Surface's tab title from a non-UI thread (set_title may
+/// come from the engine/IO thread). wparam carries a heap-allocated
+/// TabTitleMsg whose ownership the handler takes.
+const WM_APP_SET_TAB_TITLE: UINT = WM_APP + 4;
+const TabTitleMsg = struct { surface: *Surface, title: []u8 };
 
 const SWP_NOZORDER: UINT = 0x0004;
 const SWP_NOACTIVATE: UINT = 0x0010;
@@ -168,6 +173,7 @@ const PAINTSTRUCT = extern struct {
     rgbReserved: [32]u8,
 };
 const WM_LBUTTONDOWN: UINT = 0x0201;
+const WM_SETTEXT: UINT = 0x000C;
 const TRANSPARENT: i32 = 1;
 const DT_LEFT: UINT = 0x0000;
 const DT_CENTER: UINT = 0x0001;
@@ -186,6 +192,11 @@ extern "gdi32" fn SetTextColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLO
 extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, w: i32, h: i32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn FillRgn(hdc: HDC, hrgn: ?*anyopaque, hbr: HBRUSH) callconv(.winapi) BOOL;
+extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
+extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, cx: i32, cy: i32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) BOOL;
+extern "gdi32" fn BitBlt(hdc: HDC, x: i32, y: i32, cx: i32, cy: i32, hdc_src: HDC, x1: i32, y1: i32, rop: DWORD) callconv(.winapi) BOOL;
+const SRCCOPY: DWORD = 0x00CC0020;
 extern "gdi32" fn CreateFontW(
     nHeight: i32, nWidth: i32, nEscapement: i32, nOrientation: i32,
     fnWeight: i32, fdwItalic: DWORD, fdwUnderline: DWORD, fdwStrikeOut: DWORD,
@@ -198,10 +209,10 @@ const CLEARTYPE_QUALITY: DWORD = 5;
 
 // Tab strip geometry (logical px at 96 DPI; scaled by DPI at runtime).
 const tab_strip_base: i32 = 32;
-const tab_max_w: i32 = 240;
-const tab_min_w: i32 = 90;
+const tab_fixed_w_base: i32 = 180;
+const arrow_w_base: i32 = 28;
 const new_btn_w: i32 = 32;
-const tab_close_w: i32 = 24;
+const tab_close_w: i32 = 22;
 
 // ---------------------------------------------------------------------------
 // Public API.
@@ -240,6 +251,10 @@ tabs: std.array_list.Managed(*Surface),
 active: usize = 0,
 /// Cached Segoe UI font for the tab strip. Recreated on DPI change.
 tab_font: ?*anyopaque = null,
+/// Index of the first visible tab in the strip when there are too many tabs
+/// to fit. Adjusted by the `<` / `>` overflow buttons and auto-scrolled to
+/// keep the active tab in view.
+tab_scroll: i32 = 0,
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWin32Parent");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -420,6 +435,23 @@ pub fn requestCloseSurface(self: *const Self, surface: *Surface) void {
     _ = PostMessageW(self.hwnd, WM_APP_CLOSE_SURFACE, @intFromPtr(surface), 0);
 }
 
+/// Thread-safe: ask the UI thread to update `surface`'s tab title. The title
+/// is duplicated; the handler frees the duplicate (and the wrapper struct)
+/// after applying or if the surface has gone away.
+pub fn requestSetTabTitle(self: *const Self, surface: *Surface, title: []const u8) void {
+    const alloc = std.heap.c_allocator;
+    const msg = alloc.create(TabTitleMsg) catch return;
+    msg.title = alloc.dupe(u8, title) catch {
+        alloc.destroy(msg);
+        return;
+    };
+    msg.surface = surface;
+    if (PostMessageW(self.hwnd, WM_APP_SET_TAB_TITLE, @intFromPtr(msg), 0) == FALSE) {
+        alloc.free(msg.title);
+        alloc.destroy(msg);
+    }
+}
+
 /// Thread-safe: ask the UI thread to drain the core app mailbox. Called by
 /// App.wakeup, which the engine invokes whenever it pushes a surface/app
 /// message (e.g. child_exited).
@@ -459,6 +491,9 @@ fn applyActiveVisibility(self: *Self) void {
 /// tab strip. Invoked on WM_SIZE and on first attach / tab switch.
 fn layoutActive(self: *Self) void {
     const surface = self.activeSurface() orelse return;
+    // Auto-scroll so the active tab is in view (also re-clamps scroll on
+    // resize/tab-removal).
+    self.ensureActiveVisible();
     const strip = self.stripHeight();
     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &rect);
@@ -487,11 +522,70 @@ fn invalidateStrip(self: *const Self) void {
     _ = InvalidateRect(self.hwnd, &r, FALSE);
 }
 
-/// Width of each tab given the client width and tab count.
-fn tabWidth(width: i32, n: i32) i32 {
-    if (n <= 0) return 0;
-    const avail = @max(0, width - new_btn_w);
-    return std.math.clamp(@divTrunc(avail, n), tab_min_w, tab_max_w);
+/// Layout of the tab strip for a given client width. Computed once per paint
+/// or hit-test so both stay in sync.
+const StripLayout = struct {
+    tw: i32, // tab width (fixed)
+    aw: i32, // arrow button width
+    bw: i32, // "+" button width
+    n: i32, // total tab count
+    visible_count: i32, // how many tabs fit
+    show_arrows: bool,
+    tabs_right: i32, // x of right edge of the visible-tabs area
+    x_lt: i32 = 0,
+    x_gt: i32 = 0,
+    x_plus: i32 = 0,
+};
+
+fn computeStripLayout(self: *Self, width: i32) StripLayout {
+    const dpi: i32 = @intCast(GetDpiForWindow(self.hwnd));
+    const tw = @divTrunc(tab_fixed_w_base * dpi, 96);
+    const aw = @divTrunc(arrow_w_base * dpi, 96);
+    const bw = @divTrunc(new_btn_w * dpi, 96);
+    const n: i32 = @intCast(self.tabs.items.len);
+    var L: StripLayout = .{
+        .tw = tw, .aw = aw, .bw = bw, .n = n,
+        .visible_count = 0,
+        .show_arrows = false,
+        .tabs_right = 0,
+    };
+    if (n == 0) {
+        L.x_plus = 0;
+        return L;
+    }
+    if (n * tw + bw <= width) {
+        // Everything fits, no scrolling needed.
+        L.visible_count = n;
+        L.tabs_right = n * tw;
+        L.x_plus = L.tabs_right;
+    } else {
+        // Overflow: reserve right side for arrows + plus.
+        L.show_arrows = true;
+        const tabs_area_w = @max(0, width - 2 * aw - bw);
+        L.visible_count = @max(1, @divTrunc(tabs_area_w, tw));
+        L.tabs_right = L.visible_count * tw;
+        L.x_lt = L.tabs_right;
+        L.x_gt = L.x_lt + aw;
+        L.x_plus = L.x_gt + aw;
+    }
+    // Clamp scroll to [0, n - visible_count].
+    const max_scroll = @max(0, n - L.visible_count);
+    if (self.tab_scroll > max_scroll) self.tab_scroll = max_scroll;
+    if (self.tab_scroll < 0) self.tab_scroll = 0;
+    return L;
+}
+
+/// Adjust `tab_scroll` so the active tab is visible.
+fn ensureActiveVisible(self: *Self) void {
+    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = GetClientRect(self.hwnd, &rect);
+    const L = self.computeStripLayout(rect.right);
+    const active: i32 = @intCast(self.active);
+    if (active < self.tab_scroll) {
+        self.tab_scroll = active;
+    } else if (active >= self.tab_scroll + L.visible_count) {
+        self.tab_scroll = active - L.visible_count + 1;
+    }
 }
 
 /// Paint the tab strip. Called from WM_PAINT.
@@ -500,6 +594,7 @@ fn paintTabStrip(self: *Self, hdc: HDC, width: i32) void {
     const dpi: i32 = @intCast(GetDpiForWindow(self.hwnd));
     const radius = @max(6, @divTrunc(10 * dpi, 96));
     const pad_top = @max(3, @divTrunc(4 * dpi, 96));
+    const close_w = @divTrunc(tab_close_w * dpi, 96);
 
     // Strip background.
     const strip_bg = CreateSolidBrush(0x002b2b2b);
@@ -507,50 +602,66 @@ fn paintTabStrip(self: *Self, hdc: HDC, width: i32) void {
     _ = FillRect(hdc, &full, strip_bg);
     _ = DeleteObject(strip_bg);
 
-    // Use the cached Segoe UI font; transparent text background.
+    // Use the cached Segoe UI font; transparent text background. GDI font
+    // linking falls back to Segoe UI Symbol / Segoe UI Emoji for glyphs the
+    // base face lacks (monochrome — color emoji would need DirectWrite).
     if (self.tab_font) |f| _ = SelectObject(hdc, f);
     _ = SetBkMode(hdc, TRANSPARENT);
 
-    const n: i32 = @intCast(self.tabs.items.len);
-    const tw = tabWidth(width, n);
+    const L = self.computeStripLayout(width);
+    if (L.n == 0) return;
 
-    // Tabs: rounded-rect background per tab, then title + close glyph.
-    // Extending the bottom past the visible strip makes the lower corners
-    // square-looking (clipped at the band) while the top stays rounded —
-    // the modern terminal-tab look.
+    // Draw the visible tab range starting at column 0 of the strip.
     var i: i32 = 0;
-    while (i < n) : (i += 1) {
-        const x = i * tw;
-        const active = (@as(usize, @intCast(i)) == self.active);
+    while (i < L.visible_count) : (i += 1) {
+        const tab_idx = i + self.tab_scroll;
+        if (tab_idx < 0 or tab_idx >= L.n) break;
+        const x = i * L.tw;
+        const active = (@as(usize, @intCast(tab_idx)) == self.active);
 
         const tab_bg = CreateSolidBrush(if (active) 0x00181818 else 0x00333333);
-        const rgn = CreateRoundRectRgn(x + 1, pad_top, x + tw - 1, strip + radius, radius * 2, radius * 2);
+        const rgn = CreateRoundRectRgn(x + 1, pad_top, x + L.tw - 1, strip + radius, radius * 2, radius * 2);
         if (rgn) |r| {
             _ = FillRgn(hdc, r, tab_bg);
             _ = DeleteObject(r);
         }
         _ = DeleteObject(tab_bg);
 
-        // Title (index-based label until per-tab titles are wired).
-        var buf: [32]u8 = undefined;
-        const label = std.fmt.bufPrint(&buf, "Terminal {d}", .{i + 1}) catch "Terminal";
-        var w16: [48]u16 = undefined;
-        const wlen = std.unicode.utf8ToUtf16Le(&w16, label) catch 0;
+        // Title: per-tab if set (e.g. via OSC 2), else "Terminal N".
+        var fbuf: [32]u8 = undefined;
+        const surf = self.tabs.items[@intCast(tab_idx)];
+        const label_utf8: []const u8 = if (surf.title) |t| t else (std.fmt.bufPrint(&fbuf, "Terminal {d}", .{tab_idx + 1}) catch "Terminal");
+        var w16: [256]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&w16, label_utf8) catch w16.len;
         _ = SetTextColor(hdc, if (active) 0x00ffffff else 0x00aaaaaa);
-        var lr: RECT = .{ .left = x + 14, .top = pad_top, .right = x + tw - tab_close_w, .bottom = strip };
+        var lr: RECT = .{ .left = x + 14, .top = pad_top, .right = x + L.tw - close_w, .bottom = strip };
         _ = DrawTextW(hdc, &w16, @intCast(wlen), &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        // Close "x".
+        // Close "×".
         _ = SetTextColor(hdc, if (active) 0x00cccccc else 0x00888888);
-        var cr: RECT = .{ .left = x + tw - tab_close_w, .top = pad_top, .right = x + tw - 4, .bottom = strip };
-        const x_glyph = [_]u16{ 0x00D7 }; // U+00D7 MULTIPLICATION SIGN — crisper than 'x'
+        var cr: RECT = .{ .left = x + L.tw - close_w, .top = pad_top, .right = x + L.tw - 4, .bottom = strip };
+        const x_glyph = [_]u16{0x00D7};
         _ = DrawTextW(hdc, &x_glyph, 1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
-    // New-tab "+" button.
-    const bx = n * tw;
+    // Overflow arrows (only if we don't fit). Greyed out when the action
+    // they trigger is a no-op (already at the edge).
+    if (L.show_arrows) {
+        const lt_enabled = self.tab_scroll > 0;
+        const gt_enabled = self.tab_scroll + L.visible_count < L.n;
+        _ = SetTextColor(hdc, if (lt_enabled) 0x00cccccc else 0x00555555);
+        var lr: RECT = .{ .left = L.x_lt, .top = pad_top, .right = L.x_lt + L.aw, .bottom = strip };
+        const lt_glyph = [_]u16{0x2039}; // U+2039 SINGLE LEFT-POINTING ANGLE QUOTATION MARK
+        _ = DrawTextW(hdc, &lt_glyph, 1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        _ = SetTextColor(hdc, if (gt_enabled) 0x00cccccc else 0x00555555);
+        var gr: RECT = .{ .left = L.x_gt, .top = pad_top, .right = L.x_gt + L.aw, .bottom = strip };
+        const gt_glyph = [_]u16{0x203A}; // U+203A SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+        _ = DrawTextW(hdc, &gt_glyph, 1, &gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // New-tab "+".
     _ = SetTextColor(hdc, 0x00cccccc);
-    var pr: RECT = .{ .left = bx, .top = pad_top, .right = bx + new_btn_w, .bottom = strip };
+    var pr: RECT = .{ .left = L.x_plus, .top = pad_top, .right = L.x_plus + L.bw, .bottom = strip };
     const plus = [_]u16{'+'};
     _ = DrawTextW(hdc, &plus, 1, &pr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
@@ -560,25 +671,38 @@ fn onStripClick(self: *Self, x: i32, y: i32) bool {
     if (y < 0 or y >= self.stripHeight()) return false;
     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &rect);
-    const n: i32 = @intCast(self.tabs.items.len);
-    const tw = tabWidth(rect.right, n);
+    const L = self.computeStripLayout(rect.right);
+    if (L.n == 0) return false;
 
-    // New-tab button.
-    if (x >= n * tw and x < n * tw + new_btn_w) {
+    // Right-side widgets (when overflow): <, >, +.
+    if (L.show_arrows) {
+        if (x >= L.x_lt and x < L.x_gt) {
+            if (self.tab_scroll > 0) self.tab_scroll -= 1;
+            return true;
+        }
+        if (x >= L.x_gt and x < L.x_plus) {
+            if (self.tab_scroll + L.visible_count < L.n) self.tab_scroll += 1;
+            return true;
+        }
+    }
+    if (x >= L.x_plus and x < L.x_plus + L.bw) {
         self.newTab() catch |e| log.warn("newTab failed: {}", .{e});
         return true;
     }
 
-    if (tw <= 0) return false;
-    const i = @divTrunc(x, tw);
-    if (i < 0 or i >= n) return false;
+    // Tab body.
+    if (x < 0 or x >= L.tabs_right or L.tw <= 0) return false;
+    const visible_i = @divTrunc(x, L.tw);
+    const tab_idx = visible_i + self.tab_scroll;
+    if (tab_idx < 0 or tab_idx >= L.n) return false;
 
-    // Close button region at the right edge of the tab.
-    const x_in_tab = x - i * tw;
-    if (x_in_tab >= tw - tab_close_w) {
-        self.closeTab(@intCast(i));
+    const dpi: i32 = @intCast(GetDpiForWindow(self.hwnd));
+    const close_w = @divTrunc(tab_close_w * dpi, 96);
+    const x_in_tab = x - visible_i * L.tw;
+    if (x_in_tab >= L.tw - close_w) {
+        self.closeTab(@intCast(tab_idx));
     } else {
-        self.switchTab(@intCast(i));
+        self.switchTab(@intCast(tab_idx));
     }
     return true;
 }
@@ -613,13 +737,72 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_SIZE => {
             if (recoverSelf(hwnd)) |self| self.layoutActive();
         },
+        WM_SETTEXT => {
+            // External callers (e.g. tools/set_title.exe) set the window
+            // caption to express "title this terminal". Mirror that into
+            // the ACTIVE tab's title so the strip shows it. We still fall
+            // through to DefWindowProcW so the actual caption updates too
+            // (the heartbeat will overwrite it shortly with "Ghostty - FPS").
+            if (recoverSelf(hwnd)) |self| settext: {
+                const surf = self.activeSurface() orelse break :settext;
+                if (lparam == 0) break :settext;
+                const wptr: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                var wlen: usize = 0;
+                while (wptr[wlen] != 0) : (wlen += 1) {}
+                // Filter out our own watchdog/FPS heartbeat string so it
+                // doesn't pollute tab titles every 2s — that path sets the
+                // OS caption (which it still gets to do via DefWindowProc),
+                // but we only want the tab to reflect explicit titles.
+                const heartbeat = comptime std.unicode.utf8ToUtf16LeStringLiteral("Ghostty - FPS=");
+                if (wlen >= heartbeat.len) {
+                    var matches = true;
+                    for (heartbeat[0..heartbeat.len], 0..) |c, i| {
+                        if (wptr[i] != c) { matches = false; break; }
+                    }
+                    if (matches) break :settext;
+                }
+                var ubuf: [512]u8 = undefined;
+                const ulen = std.unicode.utf16LeToUtf8(&ubuf, wptr[0..wlen]) catch break :settext;
+                if (ulen == 0) break :settext;
+                const alloc = std.heap.c_allocator;
+                const dup = alloc.dupe(u8, ubuf[0..ulen]) catch break :settext;
+                if (surf.title) |old| alloc.free(old);
+                surf.title = dup;
+                self.invalidateStrip();
+            }
+            // Fall through so DefWindowProcW also sets the OS caption.
+        },
+        WM_ERASEBKGND => {
+            // We paint the strip ourselves (and child windows cover the rest
+            // under WS_CLIPCHILDREN); suppressing the OS erase removes the
+            // flash-of-class-brush that causes flicker before WM_PAINT.
+            return 1;
+        },
         WM_PAINT => {
             if (recoverSelf(hwnd)) |self| {
                 var ps: PAINTSTRUCT = undefined;
                 if (BeginPaint(hwnd, &ps)) |hdc| {
                     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
                     _ = GetClientRect(hwnd, &rect);
-                    self.paintTabStrip(hdc, rect.right);
+                    const strip_h = self.stripHeight();
+                    const w = rect.right;
+                    // Double-buffer: paint into an off-screen DC, then blit
+                    // once — no visible erase/repaint flicker as tab titles
+                    // update on heartbeat / OSC 2.
+                    if (CreateCompatibleDC(hdc)) |mem_dc| {
+                        if (CreateCompatibleBitmap(hdc, w, strip_h)) |mem_bmp| {
+                            const old = SelectObject(mem_dc, mem_bmp);
+                            self.paintTabStrip(mem_dc, w);
+                            _ = BitBlt(hdc, 0, 0, w, strip_h, mem_dc, 0, 0, SRCCOPY);
+                            _ = SelectObject(mem_dc, old);
+                            _ = DeleteObject(mem_bmp);
+                        } else {
+                            self.paintTabStrip(hdc, w);
+                        }
+                        _ = DeleteDC(mem_dc);
+                    } else {
+                        self.paintTabStrip(hdc, w);
+                    }
                     _ = EndPaint(hwnd, &ps);
                 }
             }
@@ -677,6 +860,25 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         WM_APP_TICK => {
             if (recoverSelf(hwnd)) |self| self.tickCoreApp();
+            return 0;
+        },
+        WM_APP_SET_TAB_TITLE => {
+            const alloc = std.heap.c_allocator;
+            const tt: *TabTitleMsg = @ptrFromInt(wparam);
+            var applied = false;
+            if (recoverSelf(hwnd)) |self| {
+                for (self.tabs.items) |s| {
+                    if (s == tt.surface) {
+                        if (s.title) |old| alloc.free(old);
+                        s.title = tt.title;
+                        applied = true;
+                        self.invalidateStrip();
+                        break;
+                    }
+                }
+            }
+            if (!applied) alloc.free(tt.title);
+            alloc.destroy(tt);
             return 0;
         },
         WM_APP_CLOSE_SURFACE => {

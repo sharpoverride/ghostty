@@ -67,16 +67,16 @@ pub fn performAction(
     return switch (action) {
         .set_title => blk: {
             // .set_title is always per-surface — the engine never sends it
-            // with .app target. We route to the parent's title bar (the
-            // visible chrome); the child window has its own text but it's
-            // not displayed.
+            // with .app target. Update the source surface's tab title (the
+            // strip repaints from there). The window caption stays as the
+            // watchdog-set "Ghostty - FPS=N" heartbeat string.
             const core_surface = switch (target) {
-                .surface => |_| {},
+                .surface => |s| s,
                 .app => break :blk false,
             };
-            _ = core_surface;
             const parent = self.parent orelse break :blk false;
-            try parent.setTitle(value.title);
+            const ws: *Surface = core_surface.rt_surface;
+            parent.requestSetTabTitle(ws, value.title);
             break :blk true;
         },
 

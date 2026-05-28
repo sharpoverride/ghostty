@@ -26,6 +26,11 @@ alloc: Allocator,
 app: *ApprtApp,
 window: *Window,
 gl_ctx: gl.Context,
+/// Owned UTF-8 tab title (e.g. set via OSC 2/0). null = fall back to a
+/// generic index-based label in the tab strip. Written by the UI thread
+/// only (ParentWindow's WM_APP_SET_TAB_TITLE handler) so paintTabStrip can
+/// read it lock-free. Allocated with std.heap.c_allocator.
+title: ?[]u8 = null,
 /// Owned Config, kept alive for the lifetime of CoreSurface (CoreSurface
 /// only copies derived bits during init; some string slices may point back
 /// into our config's arena).
@@ -131,6 +136,8 @@ pub fn deinit(self: *Self) void {
     // Unregister from the core app first so no further surface messages are
     // dispatched to us mid-teardown.
     self.app.core_app.deleteSurface(self);
+
+    if (self.title) |t| std.heap.c_allocator.free(t);
 
     // Signal the renderer thread's manual loop to exit BEFORE
     // core_surface.deinit (which joins that thread). The xev stop async
