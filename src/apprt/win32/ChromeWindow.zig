@@ -1243,16 +1243,19 @@ fn applyActiveVisibility(self: *Self) void {
 fn layoutActive(self: *Self) void {
     const surface = self.activeSurface() orelse return;
     const sb = self.sidebarWidth();
-    const hd = self.headerHeight();
     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &rect);
+    // Terminal fills the entire area to the right of the sidebar, from the
+    // top of the client area down. There's no top header strip in the
+    // modern chrome — the hamburger/new-tab buttons live in the sidebar's
+    // own top region, so the console gets the full height beside it.
     const w = @max(0, rect.right - rect.left - sb);
-    const h = @max(0, rect.bottom - rect.top - hd);
+    const h = @max(0, rect.bottom - rect.top);
     _ = SetWindowPos(
         surface.window.hwnd,
         null,
         sb,
-        hd,
+        0,
         w,
         h,
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -1391,7 +1394,6 @@ fn paint(self: *Self) void {
     var client: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &client);
     const dpi: i32 = self.currentDpi();
-    const fw: f32 = @as(f32, @floatFromInt((client.right - client.left) * 96)) / @as(f32, @floatFromInt(dpi));
     const fh: f32 = @as(f32, @floatFromInt((client.bottom - client.top) * 96)) / @as(f32, @floatFromInt(dpi));
     const fsb: f32 = @floatFromInt(self.sidebarBase());
     const fhd: f32 = @floatFromInt(header_height_base);
@@ -1416,13 +1418,9 @@ fn paint(self: *Self) void {
         rt.vtbl.FillRectangle(rt, &overlay, brush_base);
     }
 
-    // Header band (sits on top of the surface area, to the right of the
-    // sidebar). Slice 1: just a flat strip; icons come in slice 3.
-    if (self.brush_header) |b| {
-        const brush_base: *ID2D1Brush = @ptrCast(b);
-        const r = D2D1_RECT_F{ .left = fsb, .top = 0, .right = fw, .bottom = fhd };
-        rt.vtbl.FillRectangle(rt, &r, brush_base);
-    }
+    // No top header band right of the sidebar: the console fills the full
+    // height beside the sidebar. The hamburger/new-tab buttons sit in the
+    // sidebar's own top region (drawn on the sidebar background below).
 
     // Search field (above tab rows, only when sidebar is expanded).
     if (!self.collapsed) self.paintSearchField(rt);
