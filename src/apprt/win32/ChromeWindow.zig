@@ -915,6 +915,28 @@ pub fn newTab(self: *Self) !void {
         self.app.pending_command = prev;
     };
 
+    // Open the new tab in the active tab's current directory (its
+    // OSC 7-reported cwd) so new tabs follow the drive/dir you're working
+    // in. Skipped if the caller already set pending_cwd, or if the active
+    // tab hasn't reported a cwd yet (falls back to the config default).
+    var inherited_cwd: ?[]const u8 = null;
+    const prev_cwd = self.app.pending_cwd;
+    if (self.app.pending_cwd == null) {
+        if (self.activeSurface()) |active| {
+            if (active.core_surface.pwd(self.alloc)) |maybe_cwd| {
+                if (maybe_cwd) |cwd| {
+                    inherited_cwd = cwd;
+                    self.app.pending_cwd = cwd;
+                    log.info("new tab inheriting cwd: {s}", .{cwd});
+                }
+            } else |_| {}
+        }
+    }
+    defer {
+        self.app.pending_cwd = prev_cwd;
+        if (inherited_cwd) |c| self.alloc.free(c);
+    }
+
     const surface = try Surface.create(self.alloc, self.app, @ptrCast(self.hwnd));
     errdefer surface.deinit();
     try self.appendTab(surface);

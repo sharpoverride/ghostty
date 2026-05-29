@@ -47,6 +47,11 @@ function Global:prompt {
     }
     $Global:__GhosttyFirstPrompt = $false
 
+    # OSC 7 — report the current working directory so the terminal knows
+    # where we are (drive + path). Ghostty's win32 apprt uses this to start
+    # new tabs in the same place. Format: file://HOST/forward/slashed/path.
+    $out += "$esc]7;file://$($env:COMPUTERNAME)/$($PWD.Path -replace '\\','/')$bel"
+
     # OSC 133;A — fresh line + start of prompt. `cl=line` enables
     # click-to-move-cursor; `redraw=last` matches the bash integration.
     $out += "$esc]133;A;redraw=last;cl=line$bel"

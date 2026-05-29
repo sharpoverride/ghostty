@@ -122,6 +122,15 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
         config.command = .{ .direct = argv };
     }
 
+    // Start the new tab in the active tab's directory (OSC 7-reported cwd),
+    // so opening a tab while working on D:\ or E:\ lands you on that same
+    // drive/dir. Duped into the surface allocator; config holds the slice.
+    if (app.pending_cwd) |cwd| {
+        if (cwd.len > 0) {
+            config.@"working-directory" = .{ .path = try alloc.dupe(u8, cwd) };
+        }
+    }
+
     // Remember the launch command (for session save/restore). Duped on
     // the c_allocator to match how `title` is owned.
     const launch_command: ?[]u8 = if (app.pending_command) |cmd|

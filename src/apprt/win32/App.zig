@@ -82,6 +82,11 @@ chrome: ?Chrome = null,
 /// the new tab spawns with the user's chosen shell instead of the default.
 /// Lifetime: borrowed; the chrome owns the underlying bytes.
 pending_command: ?[:0]const u8 = null,
+/// Optional working directory for the *next* surface. ChromeWindow sets
+/// this from the active tab's reported cwd (OSC 7) so new tabs open on the
+/// same drive/dir you're working in. Borrowed; valid only across the
+/// Surface.create call.
+pending_cwd: ?[]const u8 = null,
 
 pub fn init(
     self: *App,

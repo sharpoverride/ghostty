@@ -1139,7 +1139,35 @@ pub const StreamHandler = struct {
         }
 
         if (builtin.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
+            // Minimal OSC 7 handling for the win32 apprt. We trust the
+            // source (our own shell integration emits this locally) and
+            // skip the cross-host validation the POSIX path does. Extract
+            // the path from a `file://HOST/PATH` URL: take everything after
+            // the host component. Windows drive paths arrive as `C:/...`,
+            // so we drop the single leading slash and normalize to
+            // backslashes for the spawn working-directory.
+            const scheme_sep = std.mem.indexOf(u8, url, "://") orelse return;
+            const after_scheme = url[scheme_sep + 3 ..];
+            const path_start = std.mem.indexOfScalar(u8, after_scheme, '/') orelse return;
+            var raw = after_scheme[path_start + 1 ..]; // strip host
+            // "/C:/..." style — leading slash already consumed above; if a
+            // stray one remains (e.g. "//C:/"), drop it too.
+            if (raw.len >= 1 and raw[0] == '/') raw = raw[1..];
+            if (raw.len == 0) return;
+
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (raw.len > buf.len) return;
+            for (raw, 0..) |c, i| buf[i] = if (c == '/') '\\' else c;
+            const path = buf[0..raw.len];
+
+            log.debug("terminal pwd (win32): {s}", .{path});
+            try self.terminal.setPwd(path);
+            if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
+                self.surfaceMessageWriter(.{ .pwd_change = req });
+            } else |err| {
+                log.warn("error notifying surface of pwd change err={}", .{err});
+            }
+            if (!self.seen_title) self.windowTitle(path) catch {};
             return;
         }
 
