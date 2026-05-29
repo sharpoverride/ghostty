@@ -92,21 +92,24 @@ pub fn init(
     self.* = .{ .core_app = core_app };
 }
 
-/// Decide which chrome to use. `--new-chrome` on argv or
-/// `GHOSTTY_NEW_CHROME=1` in the environment selects the modern D2D
-/// path; otherwise we fall back to the legacy GDI tab strip.
+/// Decide which chrome to use. The modern D2D chrome is now the DEFAULT.
+/// Opt out to the legacy GDI tab strip with `--legacy-chrome` on argv or
+/// `GHOSTTY_NEW_CHROME=0` in the environment. (`--new-chrome` /
+/// `GHOSTTY_NEW_CHROME=1` still work but are now no-ops since modern is
+/// the default.)
 fn wantsNewChrome(alloc: Allocator) bool {
     if (std.process.getEnvVarOwned(alloc, "GHOSTTY_NEW_CHROME")) |val| {
         defer alloc.free(val);
-        if (val.len > 0 and val[0] != '0') return true;
+        // Explicit env override wins: "0" forces legacy, anything else modern.
+        return !(val.len > 0 and val[0] == '0');
     } else |_| {}
 
-    const args = std.process.argsAlloc(alloc) catch return false;
+    const args = std.process.argsAlloc(alloc) catch return true;
     defer std.process.argsFree(alloc, args);
     for (args) |a| {
-        if (std.mem.eql(u8, a, "--new-chrome")) return true;
+        if (std.mem.eql(u8, a, "--legacy-chrome")) return false;
     }
-    return false;
+    return true;
 }
 
 pub fn run(self: *App) !void {
