@@ -927,7 +927,6 @@ pub fn newTab(self: *Self) !void {
                 if (maybe_cwd) |cwd| {
                     inherited_cwd = cwd;
                     self.app.pending_cwd = cwd;
-                    log.info("new tab inheriting cwd: {s}", .{cwd});
                 }
             } else |_| {}
         }
