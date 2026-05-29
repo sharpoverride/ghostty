@@ -124,10 +124,6 @@ const AUTOHEAL_INTERVAL_MS: UINT = 2_000;
 /// recent restorable state (a graceful close also snapshots on WM_CLOSE).
 const SNAPSHOT_TIMER_ID: usize = 2;
 const SNAPSHOT_INTERVAL_MS: UINT = 10_000;
-/// One-shot timer to flush restored scrollback into tabs AFTER the window
-/// has shown and sized (so the initial resize/clear doesn't wipe it).
-const RESTORE_INJECT_TIMER_ID: usize = 3;
-const RESTORE_INJECT_DELAY_MS: UINT = 250;
 const MONITOR_DEFAULTTONULL: DWORD = 0;
 
 const SWP_NOZORDER: UINT = 0x0004;
@@ -1034,13 +1030,17 @@ pub fn restoreSession(self: *Self) bool {
         }
         const surf = self.tabs.items[self.tabs.items.len - 1];
 
-        // Stash the saved scrollback to replay once the terminal is live
-        // (flushed by the one-shot RESTORE_INJECT timer below). Injecting
-        // now — before the message pump / first WM_SIZE — would be wiped by
-        // the surface's initial resize/clear. c_allocator so the Surface
-        // owns it like its other late-freed buffers.
+        // Hand the saved scrollback to termio, which replays it
+        // deterministically right after the relaunched shell's startup
+        // clear (ESC[2J) — see Termio.restore_preamble. The Surface owns
+        // the buffer (c_allocator) and frees it in deinit; termio only
+        // borrows it. This is timing-independent, unlike the old
+        // wall-clock inject timer.
         if (session.readScrollback(std.heap.c_allocator, tab.scrollback_file)) |blob| {
-            if (blob.len > 0) surf.pending_preamble = blob else std.heap.c_allocator.free(blob);
+            if (blob.len > 0) {
+                surf.pending_preamble = blob;
+                surf.core_surface.io.restore_preamble = blob;
+            } else std.heap.c_allocator.free(blob);
         } else |_| {}
 
         // Re-apply a user rename so it survives the relaunch.
@@ -1056,22 +1056,7 @@ pub fn restoreSession(self: *Self) bool {
     if (s.active < self.tabs.items.len) self.switchTab(s.active);
     self.layoutActive();
     _ = InvalidateRect(self.hwnd, null, FALSE);
-    // Flush the stashed scrollback shortly after the pump starts (and the
-    // first WM_SIZE has set the real terminal size).
-    _ = SetTimer(self.hwnd, RESTORE_INJECT_TIMER_ID, RESTORE_INJECT_DELAY_MS, null);
     return true;
-}
-
-/// Replay each restored tab's saved scrollback into its now-live terminal,
-/// then clear the pending buffers. One-shot.
-fn flushPreambles(self: *Self) void {
-    for (self.tabs.items) |s| {
-        if (s.pending_preamble) |blob| {
-            s.core_surface.io.processOutput(blob);
-            std.heap.c_allocator.free(blob);
-            s.pending_preamble = null;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2207,10 +2192,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_TIMER => {
             if (wparam == AUTOHEAL_TIMER_ID) self.autoHeal();
             if (wparam == SNAPSHOT_TIMER_ID) self.saveSession();
-            if (wparam == RESTORE_INJECT_TIMER_ID) {
-                _ = KillTimer(hwnd, RESTORE_INJECT_TIMER_ID); // one-shot
-                self.flushPreambles();
-            }
             return 0;
         },
         WM_ACTIVATE => {

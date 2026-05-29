@@ -12,10 +12,22 @@
 $Global:__GhosttyHasRun = $true
 $Global:__GhosttyFirstPrompt = $true
 
-# Preserve any user-defined prompt so we can render it between our markers
-# instead of clobbering the user's customizations.
+# Preserve a *genuinely user-defined* prompt so we render it between our
+# markers. PowerShell always ships a built-in `prompt` function whose body
+# just emits a bare "PS <loc>> "; preserving that one means tabs show an
+# unhelpful "PS>" (the location often renders empty under ConPTY). So we
+# only preserve the prompt if it isn't the built-in default — detected by
+# the built-in's help-link marker / CurrentLocation body. Otherwise we
+# fall through to our own full-path prompt below.
+$Global:__GhosttyHasUserPrompt = $false
 if (Test-Path Function:\prompt) {
-    Rename-Item Function:\prompt Global:__GhosttyOriginalPrompt -ErrorAction SilentlyContinue
+    $def = ''
+    try { $def = (Get-Item Function:\prompt).ScriptBlock.ToString() } catch {}
+    $isBuiltin = $def -match 'fwlink' -or $def -match 'ExternalHelp' -or $def -match 'CurrentLocation'
+    if (-not $isBuiltin) {
+        Rename-Item Function:\prompt Global:__GhosttyOriginalPrompt -ErrorAction SilentlyContinue
+        $Global:__GhosttyHasUserPrompt = $true
+    }
 }
 
 function Global:prompt {
@@ -39,12 +51,14 @@ function Global:prompt {
     # click-to-move-cursor; `redraw=last` matches the bash integration.
     $out += "$esc]133;A;redraw=last;cl=line$bel"
 
-    # Render the user's original prompt, or a sensible default.
-    if (Test-Path Function:\__GhosttyOriginalPrompt) {
+    # Render the user's original prompt if they defined one; otherwise our
+    # default, which always shows the full filesystem path (e.g.
+    # "PS E:\ghosttty> ") via $PWD.Path — more useful than the built-in's
+    # bare "PS>".
+    if ($Global:__GhosttyHasUserPrompt -and (Test-Path Function:\__GhosttyOriginalPrompt)) {
         $out += [string](& $Global:__GhosttyOriginalPrompt)
     } else {
-        $loc = $executionContext.SessionState.Path.CurrentLocation
-        $out += "PS $loc$('>' * ($nestedPromptLevel + 1)) "
+        $out += "PS $($PWD.Path)$('>' * ($nestedPromptLevel + 1)) "
     }
 
     # OSC 133;B — end of prompt, start of user input. Everything the user

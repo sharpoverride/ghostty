@@ -63,6 +63,12 @@ mailbox: termio.Mailbox,
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
+/// Optional borrowed VT bytes to replay into the stream once, right after
+/// the shell's startup clear (ESC[2J), for win32 session restore. The
+/// owner (the apprt Surface) keeps the buffer alive and frees it; we just
+/// read it and null this pointer after the one-shot injection.
+restore_preamble: ?[]const u8 = null,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.time.Instant = null,
@@ -690,6 +696,22 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         }
     } else {
         self.terminal_stream.nextSlice(buf);
+    }
+
+    // Session-restore scrollback injection (win32 apprt). When a borrowed
+    // preamble is set, we replay it into the stream right AFTER the chunk
+    // that carries the shell's startup clear (ESC[2J). This is
+    // deterministic on content rather than wall-clock timing, so the saved
+    // history lands in the freshly-cleared viewport with the live prompt
+    // appearing below it — regardless of how slow/fast the shell starts.
+    if (self.restore_preamble) |preamble| {
+        if (std.mem.indexOf(u8, buf, "\x1b[2J") != null) {
+            self.restore_preamble = null; // borrowed; owner frees. One-shot.
+            self.terminal_stream.nextSlice(preamble);
+            // Fresh line + SGR reset so the shell's prompt starts cleanly
+            // below the restored history.
+            self.terminal_stream.nextSlice("\r\n\x1b[0m");
+        }
     }
 
     // If our stream handling caused messages to be sent to the mailbox
