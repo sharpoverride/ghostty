@@ -17,6 +17,7 @@ const windows = std.os.windows;
 const Allocator = std.mem.Allocator;
 const Surface = @import("Surface.zig");
 const ApprtApp = @import("App.zig");
+const session = @import("session.zig");
 
 const HWND = windows.HWND;
 const HINSTANCE = windows.HINSTANCE;
@@ -119,6 +120,14 @@ extern "kernel32" fn SearchPathW(
 
 const AUTOHEAL_TIMER_ID: usize = 1;
 const AUTOHEAL_INTERVAL_MS: UINT = 2_000;
+/// Periodic session snapshot so a force-kill/crash still leaves a
+/// recent restorable state (a graceful close also snapshots on WM_CLOSE).
+const SNAPSHOT_TIMER_ID: usize = 2;
+const SNAPSHOT_INTERVAL_MS: UINT = 10_000;
+/// One-shot timer to flush restored scrollback into tabs AFTER the window
+/// has shown and sized (so the initial resize/clear doesn't wipe it).
+const RESTORE_INJECT_TIMER_ID: usize = 3;
+const RESTORE_INJECT_DELAY_MS: UINT = 250;
 const MONITOR_DEFAULTTONULL: DWORD = 0;
 
 const SWP_NOZORDER: UINT = 0x0004;
@@ -185,6 +194,7 @@ extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
 extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.winapi) void;
 extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: usize) callconv(.winapi) HCURSOR;
 extern "user32" fn LoadIconW(hInstance: ?HINSTANCE, lpIconName: usize) callconv(.winapi) HICON;
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) callconv(.winapi) isize;
@@ -805,12 +815,14 @@ pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
     _ = UpdateWindow(hwnd);
 
     _ = SetTimer(hwnd, AUTOHEAL_TIMER_ID, AUTOHEAL_INTERVAL_MS, null);
+    _ = SetTimer(hwnd, SNAPSHOT_TIMER_ID, SNAPSHOT_INTERVAL_MS, null);
 
     return self;
 }
 
 pub fn deinit(self: *Self) void {
     _ = KillTimer(self.hwnd, AUTOHEAL_TIMER_ID);
+    _ = KillTimer(self.hwnd, SNAPSHOT_TIMER_ID);
     self.releaseRenderTargetResources();
     if (self.tab_ellipsis_sign) |s| {
         // IDWriteInlineObject's first vtable slot is QueryInterface; the
@@ -919,6 +931,147 @@ pub fn newTabWithCommand(self: *Self, command: [:0]const u8) !void {
     self.app.pending_command = command;
     defer self.app.pending_command = prev;
     try self.newTab();
+}
+
+// ---------------------------------------------------------------------------
+// Session save / restore.
+// ---------------------------------------------------------------------------
+
+/// Snapshot the current window + tabs to disk. Called periodically and on
+/// WM_CLOSE. Best-effort: failures are logged, never fatal.
+fn saveSession(self: *Self) void {
+    if (self.tabs.items.len == 0) return;
+    const alloc = self.alloc;
+
+    // Arena owns all the manifest strings; freed at the end (session.save
+    // copies what it needs to disk).
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tabs = std.array_list.Managed(session.SavedTab).init(a);
+    var blobs = std.array_list.Managed([]const u8).init(a);
+
+    var lbl_buf: [260]u8 = undefined;
+    for (self.tabs.items, 0..) |s, i| {
+        // Title: store the user's pinned name verbatim, else the friendly
+        // label (restore re-derives unpinned names from the fresh shell).
+        const title = if (s.title_pinned and s.title != null)
+            s.title.?
+        else
+            self.friendlyLabel(i, &lbl_buf);
+
+        const blob = session.captureScrollback(a, &s.core_surface, session.default_capture_rows) catch |e| blk: {
+            log.warn("capture tab {d} failed: {}", .{ i, e });
+            break :blk "";
+        };
+
+        const fname = std.fmt.allocPrint(a, "tab-{d}.vt", .{i}) catch continue;
+        tabs.append(.{
+            .title = a.dupe(u8, title) catch "",
+            .title_pinned = s.title_pinned,
+            .command = if (s.launch_command) |c| (a.dupe(u8, c) catch "") else "",
+            .cwd = "",
+            .scrollback_file = fname,
+        }) catch continue;
+        blobs.append(blob) catch continue;
+    }
+
+    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = GetWindowRect(self.hwnd, &rect);
+
+    const saved: session.SavedSession = .{
+        .saved_at_ms = std.time.milliTimestamp(),
+        .win_x = rect.left,
+        .win_y = rect.top,
+        .win_w = rect.right - rect.left,
+        .win_h = rect.bottom - rect.top,
+        .sidebar_collapsed = self.collapsed,
+        .sidebar_width = self.sidebar_width_override orelse 0,
+        .active = self.active,
+        .tabs = tabs.items,
+    };
+    session.save(alloc, saved, blobs.items) catch |e|
+        log.warn("session.save failed: {}", .{e});
+}
+
+/// Recreate tabs from a saved session if one exists. Returns true if at
+/// least one tab was restored (so App.run skips the default new tab).
+pub fn restoreSession(self: *Self) bool {
+    var loaded = (session.load(self.alloc) catch return false) orelse return false;
+    defer loaded.deinit();
+    const s = loaded.session;
+    if (s.version != 1 or s.tabs.len == 0) return false;
+
+    // Restore sidebar state up front so geometry math for new tabs is right.
+    self.collapsed = s.sidebar_collapsed;
+    if (s.sidebar_width > 0) self.sidebar_width_override = s.sidebar_width;
+
+    // Restore window placement (physical px).
+    if (s.win_w > 0 and s.win_h > 0) {
+        _ = SetWindowPos(self.hwnd, null, s.win_x, s.win_y, s.win_w, s.win_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    var restored: usize = 0;
+    for (s.tabs) |tab| {
+        // Relaunch the same shell (or the default if none was recorded).
+        const cmdz: ?[:0]const u8 = if (tab.command.len > 0)
+            (self.alloc.dupeZ(u8, tab.command) catch null)
+        else
+            null;
+        defer if (cmdz) |c| self.alloc.free(c);
+
+        if (cmdz) |c| {
+            self.newTabWithCommand(c) catch |e| {
+                log.warn("restore tab failed: {}", .{e});
+                continue;
+            };
+        } else {
+            self.newTab() catch |e| {
+                log.warn("restore tab failed: {}", .{e});
+                continue;
+            };
+        }
+        const surf = self.tabs.items[self.tabs.items.len - 1];
+
+        // Stash the saved scrollback to replay once the terminal is live
+        // (flushed by the one-shot RESTORE_INJECT timer below). Injecting
+        // now — before the message pump / first WM_SIZE — would be wiped by
+        // the surface's initial resize/clear. c_allocator so the Surface
+        // owns it like its other late-freed buffers.
+        if (session.readScrollback(std.heap.c_allocator, tab.scrollback_file)) |blob| {
+            if (blob.len > 0) surf.pending_preamble = blob else std.heap.c_allocator.free(blob);
+        } else |_| {}
+
+        // Re-apply a user rename so it survives the relaunch.
+        if (tab.title_pinned and tab.title.len > 0) {
+            if (surf.title) |old| std.heap.c_allocator.free(old);
+            surf.title = std.heap.c_allocator.dupe(u8, tab.title) catch null;
+            surf.title_pinned = true;
+        }
+        restored += 1;
+    }
+
+    if (restored == 0) return false;
+    if (s.active < self.tabs.items.len) self.switchTab(s.active);
+    self.layoutActive();
+    _ = InvalidateRect(self.hwnd, null, FALSE);
+    // Flush the stashed scrollback shortly after the pump starts (and the
+    // first WM_SIZE has set the real terminal size).
+    _ = SetTimer(self.hwnd, RESTORE_INJECT_TIMER_ID, RESTORE_INJECT_DELAY_MS, null);
+    return true;
+}
+
+/// Replay each restored tab's saved scrollback into its now-live terminal,
+/// then clear the pending buffers. One-shot.
+fn flushPreambles(self: *Self) void {
+    for (self.tabs.items) |s| {
+        if (s.pending_preamble) |blob| {
+            s.core_surface.io.processOutput(blob);
+            std.heap.c_allocator.free(blob);
+            s.pending_preamble = null;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2053,6 +2206,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         WM_TIMER => {
             if (wparam == AUTOHEAL_TIMER_ID) self.autoHeal();
+            if (wparam == SNAPSHOT_TIMER_ID) self.saveSession();
+            if (wparam == RESTORE_INJECT_TIMER_ID) {
+                _ = KillTimer(hwnd, RESTORE_INJECT_TIMER_ID); // one-shot
+                self.flushPreambles();
+            }
             return 0;
         },
         WM_ACTIVATE => {
@@ -2107,6 +2265,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_CLOSE => {
+            // Snapshot the session before tearing down so a normal close
+            // restores exactly where we left off.
+            self.saveSession();
             // Close all tabs first (they own ConPTY/renderer threads).
             while (self.tabs.items.len > 0) self.closeTab(self.tabs.items.len - 1);
             return 0;

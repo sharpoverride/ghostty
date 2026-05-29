@@ -35,6 +35,16 @@ title: ?[]u8 = null,
 /// from the shell so the user-chosen rename sticks. Set by the chrome's
 /// rename commit; never cleared (the user owns the title from then on).
 title_pinned: bool = false,
+/// The shell command this surface was launched with (argv0 path), if a
+/// non-default one was chosen via the new-tab dropdown. Owned by
+/// std.heap.c_allocator. Used by session save/restore to relaunch the
+/// same shell. null = launched with the engine/config default.
+launch_command: ?[]u8 = null,
+/// Saved scrollback (VT bytes) to replay into the terminal once it's
+/// live, set during session restore. Injected (and freed) by the
+/// chrome's one-shot restore-inject timer AFTER the first WM_SIZE, so it
+/// isn't wiped by the surface's initial resize/clear. c_allocator-owned.
+pending_preamble: ?[]u8 = null,
 /// Owned Config, kept alive for the lifetime of CoreSurface (CoreSurface
 /// only copies derived bits during init; some string slices may point back
 /// into our config's arena).
@@ -112,12 +122,20 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
         config.command = .{ .direct = argv };
     }
 
+    // Remember the launch command (for session save/restore). Duped on
+    // the c_allocator to match how `title` is owned.
+    const launch_command: ?[]u8 = if (app.pending_command) |cmd|
+        (std.heap.c_allocator.dupe(u8, cmd) catch null)
+    else
+        null;
+
     self.* = .{
         .alloc = alloc,
         .app = app,
         .window = window,
         .gl_ctx = gl_ctx,
         .config = config,
+        .launch_command = launch_command,
         // CoreSurface is filled in-place by its `init` method below.
         .core_surface = undefined,
     };
@@ -154,6 +172,8 @@ pub fn deinit(self: *Self) void {
     self.app.core_app.deleteSurface(self);
 
     if (self.title) |t| std.heap.c_allocator.free(t);
+    if (self.launch_command) |c| std.heap.c_allocator.free(c);
+    if (self.pending_preamble) |p| std.heap.c_allocator.free(p);
 
     // Signal the renderer thread's manual loop to exit BEFORE
     // core_surface.deinit (which joins that thread). The xev stop async

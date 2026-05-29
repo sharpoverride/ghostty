@@ -125,8 +125,18 @@ pub fn run(self: *App) !void {
         self.chrome = null;
     };
 
-    log.info("App.run: creating initial tab", .{});
-    try self.chrome.?.newTab();
+    // The modern chrome can restore the previous session (tabs +
+    // scrollback). If it does, skip creating the default tab.
+    const restored = switch (self.chrome.?) {
+        .modern => |w| w.restoreSession(),
+        .legacy => false,
+    };
+    if (!restored) {
+        log.info("App.run: creating initial tab", .{});
+        try self.chrome.?.newTab();
+    } else {
+        log.info("App.run: restored previous session", .{});
+    }
 
     log.info("App.run: entering message pump", .{});
     try self.chrome.?.run();
