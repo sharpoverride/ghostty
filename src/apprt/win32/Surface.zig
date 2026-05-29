@@ -31,6 +31,10 @@ gl_ctx: gl.Context,
 /// only (ParentWindow's WM_APP_SET_TAB_TITLE handler) so paintTabStrip can
 /// read it lock-free. Allocated with std.heap.c_allocator.
 title: ?[]u8 = null,
+/// When true, the chrome ignores subsequent OSC 0/1/2 title updates
+/// from the shell so the user-chosen rename sticks. Set by the chrome's
+/// rename commit; never cleared (the user owns the title from then on).
+title_pinned: bool = false,
 /// Owned Config, kept alive for the lifetime of CoreSurface (CoreSurface
 /// only copies derived bits during init; some string slices may point back
 /// into our config's arena).
@@ -95,6 +99,18 @@ pub fn create(alloc: Allocator, app: *ApprtApp, parent_hwnd: *anyopaque) !*Self 
     config.loadCliArgs(alloc) catch |err| {
         log.warn("loadCliArgs failed (continuing with defaults): {}", .{err});
     };
+
+    // If the chrome put a per-tab shell command in app.pending_command
+    // (e.g. user picked "Command Prompt" from the new-tab dropdown), use
+    // that instead of whatever config/CLI resolved to. Use `.direct`
+    // (single-element argv) rather than `.shell` so paths containing
+    // spaces — like `C:\Program Files\PowerShell\7\pwsh.exe` — aren't
+    // tokenized by the shell-style parser.
+    if (app.pending_command) |cmd| {
+        const argv = try alloc.alloc([:0]const u8, 1);
+        argv[0] = try alloc.dupeZ(u8, cmd);
+        config.command = .{ .direct = argv };
+    }
 
     self.* = .{
         .alloc = alloc,
@@ -193,8 +209,8 @@ pub fn close(self: *Self, process_active: bool) void {
     // child shell exits (e.g. PowerShell `exit`). This can run on the
     // renderer/IO thread, so we marshal the actual teardown to the UI thread
     // via the parent window (tab teardown joins those very threads).
-    if (self.app.parent) |parent| {
-        parent.requestCloseSurface(self);
+    if (self.app.chrome) |chrome| {
+        chrome.requestCloseSurface(self);
     }
 }
 
@@ -204,8 +220,8 @@ pub fn getTitle(self: *Self) ?[:0]const u8 {
 }
 
 pub fn getContentScale(self: *const Self) !apprt.ContentScale {
-    _ = self;
-    return .{ .x = 1.0, .y = 1.0 };
+    const scale = self.window.dpiScale();
+    return .{ .x = scale, .y = scale };
 }
 
 pub fn getSize(self: *const Self) !apprt.SurfaceSize {

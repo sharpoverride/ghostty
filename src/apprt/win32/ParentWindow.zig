@@ -869,6 +869,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             if (recoverSelf(hwnd)) |self| {
                 for (self.tabs.items) |s| {
                     if (s == tt.surface) {
+                        if (s.title_pinned) {
+                            // User renamed this tab; ignore OSC updates.
+                            break;
+                        }
                         if (s.title) |old| alloc.free(old);
                         s.title = tt.title;
                         applied = true;

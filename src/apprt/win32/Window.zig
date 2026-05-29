@@ -227,6 +227,7 @@ extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const RECT, bErase: BOO
 extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) HDC;
 extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
 extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) u32;
 // LoadCursorW takes LPCWSTR but with MAKEINTRESOURCE the value is a small
 // integer pretending to be a pointer (top bits zero). Zig refuses to coerce
 // that to an aligned [*:0]const u16, so accept usize and let Win32 do its
@@ -857,6 +858,15 @@ pub fn clientSize(self: *const Self) struct { width: u32, height: u32 } {
     };
 }
 
+/// Content scale factor (DPI / 96). 1.0 at 96 DPI, 2.0 at 200%. The
+/// engine multiplies the configured font size by this so text is the
+/// right physical size on high-DPI displays.
+pub fn dpiScale(self: *const Self) f32 {
+    const dpi = GetDpiForWindow(self.hwnd);
+    if (dpi == 0) return 1.0;
+    return @as(f32, @floatFromInt(dpi)) / 96.0;
+}
+
 /// Run the win32 message pump on the calling thread until WM_QUIT.
 pub fn run(self: *Self) !void {
     _ = self;
@@ -1170,28 +1180,27 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
     // engine sees them so terminal apps don't also receive these keys.
     // Only on press to avoid double-firing on key repeat.
     if (action == .press and mods.ctrl) {
-        const parent = surface.app.parent;
-        if (parent) |p| {
+        if (surface.app.chrome) |chrome| {
             // Ctrl+Shift+T → new tab
             if (mods.shift and vk == 0x54) {
-                p.newTab() catch |e| log.warn("newTab failed: {}", .{e});
+                chrome.newTab() catch |e| log.warn("newTab failed: {}", .{e});
                 return;
             }
             // Ctrl+W → close current tab (without shift; Ctrl+Shift+W
             // historically opens history in some apps, avoid collision).
             if (!mods.shift and vk == 0x57) {
-                p.closeTab(p.active);
+                chrome.closeTab(chrome.activeIndex());
                 return;
             }
             // Ctrl+Tab → next tab, Ctrl+Shift+Tab → previous tab.
             if (vk == 0x09) {
-                p.cycleTab(if (mods.shift) -1 else 1);
+                chrome.cycleTab(if (mods.shift) -1 else 1);
                 return;
             }
             // Ctrl+1..9 → direct tab selection by index.
             if (!mods.shift and vk >= 0x31 and vk <= 0x39) {
                 const idx: usize = @intCast(vk - 0x31);
-                p.switchTab(idx);
+                chrome.switchTab(idx);
                 return;
             }
         }
@@ -1206,6 +1215,30 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
             _ = surface.core_surface.performBindingAction(
                 .{ .paste_from_clipboard = {} },
             ) catch |e| log.warn("ctrl+v paste failed: {}", .{e});
+            return;
+        }
+
+        // Ctrl+= or Ctrl++ (Shift+=) or Ctrl+Numpad+ → increase font size.
+        // VK_OEM_PLUS = 0xBB ("="/"+" key), VK_ADD = 0x6B (numpad).
+        if (vk == 0xBB or vk == 0x6B) {
+            _ = surface.core_surface.performBindingAction(
+                .{ .increase_font_size = 1 },
+            ) catch |e| log.warn("increase_font_size failed: {}", .{e});
+            return;
+        }
+        // Ctrl+- or Ctrl+Numpad- → decrease font size.
+        // VK_OEM_MINUS = 0xBD, VK_SUBTRACT = 0x6D.
+        if (vk == 0xBD or vk == 0x6D) {
+            _ = surface.core_surface.performBindingAction(
+                .{ .decrease_font_size = 1 },
+            ) catch |e| log.warn("decrease_font_size failed: {}", .{e});
+            return;
+        }
+        // Ctrl+0 → reset font size.
+        if (vk == 0x30) {
+            _ = surface.core_surface.performBindingAction(
+                .reset_font_size,
+            ) catch |e| log.warn("reset_font_size failed: {}", .{e});
             return;
         }
     }

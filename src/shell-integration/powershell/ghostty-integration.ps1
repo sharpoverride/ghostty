@@ -64,4 +64,18 @@ if (Get-Module -ListAvailable -Name PSReadLine -ErrorAction SilentlyContinue) {
         [Console]::Write("$([char]27)]133;C$([char]7)")
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
     }
+
+    # Disable PSReadLine prediction inside Ghostty-launched shells.
+    # Recent PSReadLine ships with PredictionSource = HistoryAndPlugin
+    # enabled by default; the very first thing it suggests in a fresh
+    # shell is the previous shell's last command. If that command was
+    # `exit`, the suggestion appears inline and one Enter accepts it,
+    # which closes the tab the user just opened. Turn it off so users
+    # see a clean prompt.
+    try {
+        Set-PSReadLineOption -PredictionSource None -ErrorAction Stop
+    } catch {
+        # Older PSReadLine (<2.1) doesn't support PredictionSource.
+        # Nothing to do — predictions don't exist there.
+    }
 }

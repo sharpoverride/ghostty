@@ -757,8 +757,9 @@ fn addGtkNg(
 /// Setup the dependencies for the native Win32 apprt.
 ///
 /// Current scope: kernel32 + user32 + gdi32 + opengl32 + d3d11 + dxgi +
-/// d3dcompiler cover the HWND + ConPTY + WGL bring-up + D3D11 paths.
-/// Future feature work will pull in dwrite, shell32, ole32, imm32.
+/// d2d1 + dwrite cover the HWND + ConPTY + WGL bring-up, the D3D11 grid
+/// renderer, and the Direct2D-backed window chrome (--new-chrome).
+/// Future feature work will pull in shell32, ole32, imm32.
 fn addWin32(
     self: *const SharedDeps,
     step: *std.Build.Step.Compile,
@@ -770,6 +771,8 @@ fn addWin32(
     step.linkSystemLibrary2("opengl32", .{});
     step.linkSystemLibrary2("d3d11", .{});
     step.linkSystemLibrary2("dxgi", .{});
+    step.linkSystemLibrary2("d2d1", .{}); // Direct2D for --new-chrome
+    step.linkSystemLibrary2("dwrite", .{}); // DirectWrite (Segoe UI / Fluent Icons)
     step.linkSystemLibrary2("winmm", .{}); // timeBeginPeriod for 120fps refresh
     // d3dcompiler_47 is loaded at runtime via LoadLibrary (see
     // `renderer/d3d11/api.zig::loadD3DCompiler`). Linking the import lib
