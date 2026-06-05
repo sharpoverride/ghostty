@@ -65,6 +65,13 @@ static gv_create_env_fn gv_load_create_env() {
 }
 
 extern "C" typedef void (*gv_ready_cb)(void *ctx, void *handle, int ok);
+// Document title changed; `title` is only valid for the duration of the call.
+extern "C" typedef void (*gv_title_cb)(void *ctx, const wchar_t *title);
+// Source URL changed (navigation committed); same lifetime rule as title.
+extern "C" typedef void (*gv_url_cb)(void *ctx, const wchar_t *url);
+// ExecuteScript completed. ok=1 with the JSON-encoded result, or ok=0 and
+// result_json=null on failure. result_json only valid during the call.
+extern "C" typedef void (*gv_script_cb)(void *ctx, const wchar_t *result_json, int ok);
 
 namespace {
 
@@ -73,6 +80,8 @@ struct GvWebView {
     ICoreWebView2Controller *controller;
     ICoreWebView2 *webview;
     gv_ready_cb cb;
+    gv_title_cb title_cb;
+    gv_url_cb url_cb;
     void *ctx;
     RECT bounds;
     wchar_t *url; // heap-owned, freed in destroy
@@ -91,6 +100,100 @@ wchar_t *dupw(const wchar_t *s) {
 void fail(GvWebView *wv) {
     if (wv && wv->cb) wv->cb(wv->ctx, wv, 0);
 }
+
+// Shared QI/refcount boilerplate for the single-interface event handlers
+// below. `Derived` supplies its interface IID via kIID and inherits from it.
+template <typename Iface, const IID &iid> class GvHandlerBase : public Iface {
+public:
+    GvWebView *wv;
+    LONG ref;
+    explicit GvHandlerBase(GvWebView *w) : wv(w), ref(1) {}
+    virtual ~GvHandlerBase() {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (InlineIsEqualGUID(riid, kIID_IUnknown) ||
+            InlineIsEqualGUID(riid, iid)) {
+            *ppv = static_cast<Iface *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG c = InterlockedDecrement(&ref);
+        if (c == 0) delete this;
+        return (ULONG)c;
+    }
+};
+
+// DocumentTitleChanged → gv_title_cb with the new title.
+class TitleHandler
+    : public GvHandlerBase<ICoreWebView2DocumentTitleChangedEventHandler,
+                           IID_ICoreWebView2DocumentTitleChangedEventHandler> {
+public:
+    using GvHandlerBase::GvHandlerBase;
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender, IUnknown *) override {
+        if (!wv->title_cb) return S_OK;
+        LPWSTR title = nullptr;
+        if (SUCCEEDED(sender->get_DocumentTitle(&title)) && title) {
+            wv->title_cb(wv->ctx, title);
+            CoTaskMemFree(title);
+        }
+        return S_OK;
+    }
+};
+
+// SourceChanged → gv_url_cb with the new source URL.
+class SourceHandler
+    : public GvHandlerBase<ICoreWebView2SourceChangedEventHandler,
+                           IID_ICoreWebView2SourceChangedEventHandler> {
+public:
+    using GvHandlerBase::GvHandlerBase;
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
+                                     ICoreWebView2SourceChangedEventArgs *) override {
+        if (!wv->url_cb) return S_OK;
+        LPWSTR uri = nullptr;
+        if (SUCCEEDED(sender->get_Source(&uri)) && uri) {
+            wv->url_cb(wv->ctx, uri);
+            CoTaskMemFree(uri);
+        }
+        return S_OK;
+    }
+};
+
+// ExecuteScript completion → gv_script_cb. Carries its own ctx (per call),
+// not the GvWebView ctx.
+class ScriptHandler : public ICoreWebView2ExecuteScriptCompletedHandler {
+public:
+    gv_script_cb cb;
+    void *ctx;
+    LONG ref;
+    ScriptHandler(gv_script_cb c, void *x) : cb(c), ctx(x), ref(1) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (InlineIsEqualGUID(riid, kIID_IUnknown) ||
+            InlineIsEqualGUID(riid, IID_ICoreWebView2ExecuteScriptCompletedHandler)) {
+            *ppv = static_cast<ICoreWebView2ExecuteScriptCompletedHandler *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG c = InterlockedDecrement(&ref);
+        if (c == 0) delete this;
+        return (ULONG)c;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, LPCWSTR result_json) override {
+        if (cb) cb(ctx, SUCCEEDED(result) ? result_json : nullptr,
+                   SUCCEEDED(result) ? 1 : 0);
+        return S_OK;
+    }
+};
 
 // Completion handler invoked once the WebView2 controller (and its render
 // HWND, parented to GvWebView::parent) is ready. Sets bounds, shows it,
@@ -132,7 +235,18 @@ public:
         controller->put_Bounds(wv->bounds);
         controller->put_IsVisible(TRUE);
         controller->get_CoreWebView2(&wv->webview);
-        if (wv->webview && wv->url) wv->webview->Navigate(wv->url);
+        if (wv->webview) {
+            // Event registrations live until controller->Close() in destroy;
+            // tokens are not needed since we never selectively unregister.
+            EventRegistrationToken tok;
+            TitleHandler *th = new TitleHandler(wv);
+            wv->webview->add_DocumentTitleChanged(th, &tok);
+            th->Release();
+            SourceHandler *sh = new SourceHandler(wv);
+            wv->webview->add_SourceChanged(sh, &tok);
+            sh->Release();
+            if (wv->url) wv->webview->Navigate(wv->url);
+        }
         if (wv->cb) wv->cb(wv->ctx, wv, 1);
         return S_OK;
     }
@@ -184,7 +298,9 @@ public:
 
 extern "C" void *gv_webview_create(void *parent, const wchar_t *user_data_folder,
                                    int x, int y, int w, int h,
-                                   const wchar_t *url, gv_ready_cb cb, void *ctx) {
+                                   const wchar_t *url, gv_ready_cb cb,
+                                   gv_title_cb title_cb, gv_url_cb url_cb,
+                                   void *ctx) {
     // WebView2 needs an STA. Idempotent if the UI thread already initialized
     // COM (returns S_FALSE / RPC_E_CHANGED_MODE, both harmless here).
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -194,6 +310,8 @@ extern "C" void *gv_webview_create(void *parent, const wchar_t *user_data_folder
     wv->controller = nullptr;
     wv->webview = nullptr;
     wv->cb = cb;
+    wv->title_cb = title_cb;
+    wv->url_cb = url_cb;
     wv->ctx = ctx;
     wv->bounds.left = x;
     wv->bounds.top = y;
@@ -241,6 +359,54 @@ extern "C" void gv_webview_set_visible(void *handle, int visible) {
     GvWebView *wv = (GvWebView *)handle;
     if (!wv || !wv->controller) return;
     wv->controller->put_IsVisible(visible ? TRUE : FALSE);
+}
+
+// Navigate to `url`. If the WebView is still initializing, replace the
+// pending initial URL instead (it's navigated to once the controller is up).
+extern "C" void gv_webview_navigate(void *handle, const wchar_t *url) {
+    GvWebView *wv = (GvWebView *)handle;
+    if (!wv || !url) return;
+    if (wv->webview) {
+        wv->webview->Navigate(url);
+        return;
+    }
+    if (wv->url) HeapFree(GetProcessHeap(), 0, wv->url);
+    wv->url = dupw(url);
+}
+
+extern "C" void gv_webview_back(void *handle) {
+    GvWebView *wv = (GvWebView *)handle;
+    if (wv && wv->webview) wv->webview->GoBack();
+}
+
+extern "C" void gv_webview_forward(void *handle) {
+    GvWebView *wv = (GvWebView *)handle;
+    if (wv && wv->webview) wv->webview->GoForward();
+}
+
+extern "C" void gv_webview_reload(void *handle) {
+    GvWebView *wv = (GvWebView *)handle;
+    if (wv && wv->webview) wv->webview->Reload();
+}
+
+// Move keyboard focus into the web content (programmatic reason).
+extern "C" void gv_webview_focus(void *handle) {
+    GvWebView *wv = (GvWebView *)handle;
+    if (wv && wv->controller)
+        wv->controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+}
+
+// Evaluate JavaScript in the top frame. `cb` fires on the UI thread with the
+// JSON-encoded result. Returns 1 if the call was issued, 0 if the WebView
+// isn't ready (cb is NOT invoked in that case).
+extern "C" int gv_webview_execute_script(void *handle, const wchar_t *js,
+                                         gv_script_cb cb, void *ctx) {
+    GvWebView *wv = (GvWebView *)handle;
+    if (!wv || !wv->webview || !js) return 0;
+    ScriptHandler *sh = new ScriptHandler(cb, ctx);
+    HRESULT hr = wv->webview->ExecuteScript(js, sh);
+    sh->Release();
+    return SUCCEEDED(hr) ? 1 : 0;
 }
 
 extern "C" void gv_webview_destroy(void *handle) {
