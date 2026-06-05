@@ -72,6 +72,10 @@ extern "C" typedef void (*gv_url_cb)(void *ctx, const wchar_t *url);
 // ExecuteScript completed. ok=1 with the JSON-encoded result, or ok=0 and
 // result_json=null on failure. result_json only valid during the call.
 extern "C" typedef void (*gv_script_cb)(void *ctx, const wchar_t *result_json, int ok);
+// Key-down accelerator inside the WebView (KEY_DOWN / SYSTEM_KEY_DOWN).
+// Return 1 to mark it handled (the page never sees it), 0 to pass through.
+// Modifier state is current — query GetKeyState in the callback.
+extern "C" typedef int (*gv_accel_cb)(void *ctx, unsigned int vk);
 
 namespace {
 
@@ -82,6 +86,7 @@ struct GvWebView {
     gv_ready_cb cb;
     gv_title_cb title_cb;
     gv_url_cb url_cb;
+    gv_accel_cb accel_cb;
     void *ctx;
     RECT bounds;
     wchar_t *url; // heap-owned, freed in destroy
@@ -163,6 +168,28 @@ public:
     }
 };
 
+// AcceleratorKeyPressed (controller event) → gv_accel_cb on key-down kinds.
+class AccelHandler
+    : public GvHandlerBase<ICoreWebView2AcceleratorKeyPressedEventHandler,
+                           IID_ICoreWebView2AcceleratorKeyPressedEventHandler> {
+public:
+    using GvHandlerBase::GvHandlerBase;
+    HRESULT STDMETHODCALLTYPE
+    Invoke(ICoreWebView2Controller *,
+           ICoreWebView2AcceleratorKeyPressedEventArgs *args) override {
+        if (!wv->accel_cb) return S_OK;
+        COREWEBVIEW2_KEY_EVENT_KIND kind;
+        if (FAILED(args->get_KeyEventKind(&kind))) return S_OK;
+        if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
+            kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+            return S_OK;
+        UINT vk = 0;
+        if (FAILED(args->get_VirtualKey(&vk))) return S_OK;
+        if (wv->accel_cb(wv->ctx, vk)) args->put_Handled(TRUE);
+        return S_OK;
+    }
+};
+
 // ExecuteScript completion → gv_script_cb. Carries its own ctx (per call),
 // not the GvWebView ctx.
 class ScriptHandler : public ICoreWebView2ExecuteScriptCompletedHandler {
@@ -234,6 +261,12 @@ public:
         controller->AddRef();
         controller->put_Bounds(wv->bounds);
         controller->put_IsVisible(TRUE);
+        if (wv->accel_cb) {
+            EventRegistrationToken atok;
+            AccelHandler *ah = new AccelHandler(wv);
+            controller->add_AcceleratorKeyPressed(ah, &atok);
+            ah->Release();
+        }
         controller->get_CoreWebView2(&wv->webview);
         if (wv->webview) {
             // Event registrations live until controller->Close() in destroy;
@@ -300,7 +333,7 @@ extern "C" void *gv_webview_create(void *parent, const wchar_t *user_data_folder
                                    int x, int y, int w, int h,
                                    const wchar_t *url, gv_ready_cb cb,
                                    gv_title_cb title_cb, gv_url_cb url_cb,
-                                   void *ctx) {
+                                   gv_accel_cb accel_cb, void *ctx) {
     // WebView2 needs an STA. Idempotent if the UI thread already initialized
     // COM (returns S_FALSE / RPC_E_CHANGED_MODE, both harmless here).
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -312,6 +345,7 @@ extern "C" void *gv_webview_create(void *parent, const wchar_t *user_data_folder
     wv->cb = cb;
     wv->title_cb = title_cb;
     wv->url_cb = url_cb;
+    wv->accel_cb = accel_cb;
     wv->ctx = ctx;
     wv->bounds.left = x;
     wv->bounds.top = y;

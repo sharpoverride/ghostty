@@ -1036,11 +1036,30 @@ fn saveSession(self: *Self) void {
     var blobs = std.array_list.Managed([]const u8).init(a);
 
     var lbl_buf: [260]u8 = undefined;
+    var url_buf: [4096]u8 = undefined;
     for (self.tabs.items, 0..) |t, i| {
-        // Browser tabs aren't persisted yet (slice 4 handles URL restore).
         const s = switch (t) {
             .terminal => |surf| surf,
-            .browser => continue,
+            .browser => |pane| {
+                // Browser tabs persist their last committed URL; no
+                // scrollback sidecar.
+                const url = pane.currentUrl(&url_buf) orelse "";
+                const title = if (pane.title_pinned and pane.title != null)
+                    pane.title.?
+                else
+                    self.friendlyLabel(i, &lbl_buf);
+                tabs.append(.{
+                    .kind = "browser",
+                    .title = a.dupe(u8, title) catch "",
+                    .title_pinned = pane.title_pinned,
+                    .command = "",
+                    .cwd = "",
+                    .scrollback_file = "",
+                    .url = a.dupe(u8, url) catch "",
+                }) catch continue;
+                blobs.append("") catch continue;
+                continue;
+            },
         };
         // Title: store the user's pinned name verbatim, else the friendly
         // label (restore re-derives unpinned names from the fresh shell).
@@ -1102,6 +1121,23 @@ pub fn restoreSession(self: *Self) bool {
 
     var restored: usize = 0;
     for (s.tabs) |tab| {
+        // Browser tabs: reopen at the saved URL.
+        if (std.mem.eql(u8, tab.kind, "browser")) {
+            const url = if (tab.url.len > 0) tab.url else "https://ghostty.org";
+            self.openBrowserTo(url) catch |e| {
+                log.warn("restore browser tab failed: {}", .{e});
+                continue;
+            };
+            if (tab.title_pinned and tab.title.len > 0) {
+                const pane = self.tabs.items[self.tabs.items.len - 1].browser;
+                if (pane.title) |old| std.heap.c_allocator.free(old);
+                pane.title = std.heap.c_allocator.dupe(u8, tab.title) catch null;
+                pane.title_pinned = true;
+            }
+            restored += 1;
+            continue;
+        }
+
         // Relaunch the same shell (or the default if none was recorded).
         const cmdz: ?[:0]const u8 = if (tab.command.len > 0)
             (self.alloc.dupeZ(u8, tab.command) catch null)
@@ -1516,23 +1552,30 @@ fn layoutActive(self: *Self) void {
     if (tab == .browser) tab.browser.setBounds(w, h);
 }
 
-/// Open a new browser tab (WebView2) navigating to a fixed URL and switch
-/// to it. Driven by Ctrl+Shift+B (Window.zig forwardKey → Chrome.openBrowser).
+/// Open a new browser tab (WebView2) at the default URL and switch to it.
+/// Driven by Ctrl+Shift+B (Window.zig forwardKey → Chrome.openBrowser).
 pub fn openBrowser(self: *Self) void {
+    self.openBrowserTo("https://ghostty.org") catch |e|
+        log.warn("openBrowser failed: {}", .{e});
+}
+
+/// Open a new browser tab at `url` (UTF-8) and switch to it.
+pub fn openBrowserTo(self: *Self, url: []const u8) !void {
     const sb = self.sidebarWidth();
     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &rect);
     const w = @max(0, rect.right - rect.left - sb);
     const h = @max(0, rect.bottom - rect.top);
-    const url = std.unicode.utf8ToUtf16LeStringLiteral("https://ghostty.org");
-    const pane = BrowserPane.create(self.alloc, self.hwnd, sb, 0, w, h, url.ptr) catch |e| {
-        log.warn("openBrowser: BrowserPane.create failed: {}", .{e});
-        return;
-    };
+
+    var wurl: [2056:0]u16 = undefined;
+    const wn = std.unicode.utf8ToUtf16Le(&wurl, url) catch return error.InvalidUrl;
+    if (wn >= wurl.len) return error.InvalidUrl;
+    wurl[wn] = 0;
+
+    const pane = try BrowserPane.create(self.alloc, self.hwnd, sb, 0, w, h, wurl[0..wn :0].ptr);
     self.appendBrowserTab(pane) catch |e| {
-        log.warn("openBrowser: appendBrowserTab failed: {}", .{e});
         pane.deinit();
-        return;
+        return e;
     };
     _ = InvalidateRect(self.hwnd, null, FALSE);
     log.info("openBrowser: browser tab opened", .{});

@@ -17,6 +17,10 @@ pub const UrlFn = *const fn (ctx: ?*anyopaque, url: [*:0]const u16) callconv(.c)
 /// ExecuteScript completed: ok=1 with the JSON-encoded result, or ok=0 and
 /// result_json=null. result_json only valid during the call.
 pub const ScriptFn = *const fn (ctx: ?*anyopaque, result_json: ?[*:0]const u16, ok: c_int) callconv(.c) void;
+/// Key-down accelerator inside the WebView. Return 1 to mark it handled
+/// (the page never sees it), 0 to pass through. Query GetKeyState for
+/// modifier state — it's current during the call.
+pub const AccelFn = *const fn (ctx: ?*anyopaque, vk: c_uint) callconv(.c) c_int;
 
 extern fn gv_webview_create(
     parent: ?*anyopaque,
@@ -29,6 +33,7 @@ extern fn gv_webview_create(
     cb: ?ReadyFn,
     title_cb: ?TitleFn,
     url_cb: ?UrlFn,
+    accel_cb: ?AccelFn,
     ctx: ?*anyopaque,
 ) ?*anyopaque;
 

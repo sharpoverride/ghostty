@@ -29,17 +29,23 @@ pub const default_capture_rows: usize = 120;
 /// One persisted tab. All slices are owned by the arena/allocator the
 /// SavedSession was built with.
 pub const SavedTab = struct {
+    /// "terminal" or "browser". Defaults keep pre-browser manifests
+    /// parseable.
+    kind: []const u8 = "terminal",
     /// Friendly title shown in the sidebar (may be a user rename).
     title: []const u8,
     /// True if the user renamed it (so restore re-pins it).
     title_pinned: bool,
     /// Shell command to relaunch (argv0; e.g. the pwsh.exe path). Empty
-    /// means "use the default shell".
+    /// means "use the default shell". Terminal tabs only.
     command: []const u8,
     /// Working directory to relaunch in, if known (empty = inherit).
     cwd: []const u8,
     /// Relative filename of the .vt scrollback sidecar for this tab.
+    /// Empty for browser tabs (nothing to capture).
     scrollback_file: []const u8,
+    /// Last committed URL. Browser tabs only.
+    url: []const u8 = "",
 };
 
 /// The whole window's restorable state.
@@ -142,8 +148,9 @@ pub fn save(
     var d = try std.fs.cwd().openDir(dir, .{});
     defer d.close();
 
-    // Scrollback sidecars.
+    // Scrollback sidecars (browser tabs have none).
     for (session.tabs, blobs) |tab, blob| {
+        if (tab.scrollback_file.len == 0) continue;
         d.writeFile(.{ .sub_path = tab.scrollback_file, .data = blob }) catch |e| {
             log.warn("write scrollback {s} failed: {}", .{ tab.scrollback_file, e });
         };

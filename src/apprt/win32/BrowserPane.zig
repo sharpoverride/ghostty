@@ -52,6 +52,9 @@ const EC_RIGHTMARGIN: WPARAM = 2;
 
 const VK_RETURN: WPARAM = 0x0D;
 const VK_ESCAPE: WPARAM = 0x1B;
+const VK_CONTROL_I: i32 = 0x11;
+const VK_MENU_I: i32 = 0x12;
+const EM_SETSEL: UINT = 0x00B1;
 
 const GWLP_WNDPROC: i32 = -4;
 const GWLP_USERDATA: i32 = -21;
@@ -86,6 +89,8 @@ extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: [*:0]const u16) callconv
 extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: i32) callconv(.winapi) i32;
 extern "user32" fn MoveWindow(hWnd: HWND, X: i32, Y: i32, nWidth: i32, nHeight: i32, bRepaint: BOOL) callconv(.winapi) BOOL;
 extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+extern "user32" fn SetFocus(hWnd: ?HWND) callconv(.winapi) ?HWND;
+extern "user32" fn GetKeyState(nVirtKey: i32) callconv(.winapi) i16;
 extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const anyopaque, bErase: BOOL) callconv(.winapi) BOOL;
 extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) UINT;
 extern "gdi32" fn CreateFontW(
@@ -242,6 +247,7 @@ pub fn create(
         null,
         &onTitleChanged,
         &onSourceChanged,
+        &onAccel,
         self,
     );
     if (self.browser == null) {
@@ -262,6 +268,17 @@ pub fn setBounds(self: *Self, w: i32, h: i32) void {
     const bar_h = barHeight(self.host_hwnd);
     _ = MoveWindow(self.url_edit, 0, 0, w, bar_h, 1);
     if (self.browser) |b| webview2.setBounds(b, 0, bar_h, w, @max(0, h - bar_h));
+}
+
+/// The bar's current text — tracks the last committed URL unless the user
+/// is mid-edit. Written into `buf` as UTF-8; null when empty/unreadable.
+pub fn currentUrl(self: *Self, buf: []u8) ?[]const u8 {
+    var wbuf: [2048]u16 = undefined;
+    const wlen: usize = @intCast(GetWindowTextW(self.url_edit, &wbuf, wbuf.len));
+    if (wlen == 0) return null;
+    const n = std.unicode.utf16LeToUtf8(buf, wbuf[0..wlen]) catch return null;
+    if (n == 0) return null;
+    return buf[0..n];
 }
 
 pub fn deinit(self: *Self) void {
@@ -378,4 +395,39 @@ fn onSourceChanged(ctx: ?*anyopaque, url: [*:0]const u16) callconv(.c) void {
     const self: *Self = @ptrCast(@alignCast(ctx orelse return));
     if (GetFocus() == self.url_edit) return;
     _ = SetWindowTextW(self.url_edit, url);
+}
+
+/// AcceleratorKeyPressed (UI thread): browser-pane shortcuts while focus
+/// is inside the web content. Ctrl+L focuses the bar (select-all, like
+/// every browser), Alt+Left/Right navigate history, Ctrl+R / F5 reload.
+fn onAccel(ctx: ?*anyopaque, vk: c_uint) callconv(.c) c_int {
+    const self: *Self = @ptrCast(@alignCast(ctx orelse return 0));
+    const b = self.browser orelse return 0;
+    const ctrl = GetKeyState(VK_CONTROL_I) < 0;
+    const alt = GetKeyState(VK_MENU_I) < 0;
+    switch (vk) {
+        'L' => if (ctrl) {
+            _ = SetFocus(self.url_edit);
+            _ = SendMessageW(self.url_edit, EM_SETSEL, 0, -1);
+            return 1;
+        },
+        'R' => if (ctrl) {
+            webview2.reload(b);
+            return 1;
+        },
+        0x74 => { // VK_F5
+            webview2.reload(b);
+            return 1;
+        },
+        0x25 => if (alt) { // VK_LEFT
+            webview2.back(b);
+            return 1;
+        },
+        0x27 => if (alt) { // VK_RIGHT
+            webview2.forward(b);
+            return 1;
+        },
+        else => {},
+    }
+    return 0;
 }
