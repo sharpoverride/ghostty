@@ -84,6 +84,21 @@ pub fn build(b: *std.Build) !void {
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
 
+    // ghostty-ctl: named-pipe control client for the win32 apprt (list
+    // tabs, open browsers, navigate, eval JS). Standalone, std-only.
+    if (config.app_runtime == .win32) {
+        const ctl = b.addExecutable(.{
+            .name = "ghostty-ctl",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/ghostty-ctl/main.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+            }),
+            .use_llvm = true,
+        });
+        b.installArtifact(ctl);
+    }
+
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);
     if (config.emit_docs) {

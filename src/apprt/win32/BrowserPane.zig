@@ -270,6 +270,26 @@ pub fn setBounds(self: *Self, w: i32, h: i32) void {
     if (self.browser) |b| webview2.setBounds(b, 0, bar_h, w, @max(0, h - bar_h));
 }
 
+/// Navigate to a UTF-8 URL. No scheme defaulting — programmatic callers
+/// pass full URLs (the bar's Enter path defaults https:// itself).
+pub fn navigateTo(self: *Self, url: []const u8) !void {
+    const b = self.browser orelse return error.NotReady;
+    var wurl: [2056:0]u16 = undefined;
+    const wn = std.unicode.utf8ToUtf16Le(&wurl, url) catch return error.InvalidUrl;
+    if (wn >= wurl.len) return error.InvalidUrl;
+    wurl[wn] = 0;
+    webview2.navigate(b, wurl[0..wn :0].ptr);
+}
+
+/// Evaluate JavaScript (UTF-8) in the page; `cb` fires later on the UI
+/// thread with the JSON-encoded result. Errors if the WebView isn't up yet.
+pub fn eval(self: *Self, js: []const u8, cb: webview2.ScriptFn, ctx: ?*anyopaque) !void {
+    const b = self.browser orelse return error.NotReady;
+    const wjs = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.c_allocator, js);
+    defer std.heap.c_allocator.free(wjs);
+    if (webview2.executeScript(b, wjs.ptr, cb, ctx) == 0) return error.NotReady;
+}
+
 /// The bar's current text — tracks the last committed URL unless the user
 /// is mid-edit. Written into `buf` as UTF-8; null when empty/unreadable.
 pub fn currentUrl(self: *Self, buf: []u8) ?[]const u8 {

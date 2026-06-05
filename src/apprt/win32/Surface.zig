@@ -318,7 +318,11 @@ pub fn defaultTermioEnv(self: *Self) !std.process.EnvMap {
     // Real env so the spawned shell inherits PATH, COMSPEC, USERPROFILE, etc.
     // Allocator is the Surface's so the map's lifetime is tied to us; callers
     // (termio.Exec) typically take ownership and call deinit.
-    return try std.process.getEnvMap(self.alloc);
+    var env = try std.process.getEnvMap(self.alloc);
+    // Export the control-pipe name so `ghostty-ctl` inside this shell can
+    // talk to its host window (see apprt/win32/PipeServer.zig).
+    if (self.app.pipeName()) |name| env.put("GHOSTTY_PIPE", name) catch {};
+    return env;
 }
 
 pub fn redrawInspector(self: *Self) void {

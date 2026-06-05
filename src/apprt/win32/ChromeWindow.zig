@@ -19,6 +19,7 @@ const Surface = @import("Surface.zig");
 const ApprtApp = @import("App.zig");
 const session = @import("session.zig");
 const BrowserPane = @import("BrowserPane.zig");
+const PipeServer = @import("PipeServer.zig");
 
 /// A tab's content: either a terminal surface or an embedded browser. Both
 /// own a child HWND in the content rect, so the chrome's show/hide/layout/
@@ -265,6 +266,9 @@ const WM_APP_SET_TITLE: UINT = WM_APP + 1;
 const WM_APP_CLOSE_SURFACE: UINT = WM_APP + 2;
 const WM_APP_TICK: UINT = WM_APP + 3;
 const WM_APP_SET_TAB_TITLE: UINT = WM_APP + 4;
+/// Pipe API request marshaled from the server thread; lparam = *Request.
+/// Value mirrored in PipeServer.WM_APP_PIPE_REQUEST.
+const WM_APP_PIPE_REQUEST: UINT = WM_APP + 5;
 const TabTitleMsg = struct { surface: *Surface, title: []u8 };
 
 // ---------------------------------------------------------------------------
@@ -1581,6 +1585,165 @@ pub fn openBrowserTo(self: *Self, url: []const u8) !void {
     log.info("openBrowser: browser tab opened", .{});
 }
 
+// ---------------------------------------------------------------------------
+// Pipe API (see PipeServer.zig). Runs on the UI thread via
+// WM_APP_PIPE_REQUEST; every branch must complete the request exactly once
+// (eval completes asynchronously from the WebView2 callback).
+// ---------------------------------------------------------------------------
+
+fn handlePipeRequest(self: *Self, req: *PipeServer.Request) void {
+    switch (req.cmd) {
+        .list => self.pipeList(req),
+        .new_tab => |cmd_opt| {
+            if (cmd_opt) |cmd| {
+                const z = self.alloc.dupeZ(u8, cmd) catch {
+                    req.fail("oom");
+                    return;
+                };
+                defer self.alloc.free(z);
+                self.newTabWithCommand(z) catch |e| {
+                    req.fail(@errorName(e));
+                    return;
+                };
+            } else self.newTab() catch |e| {
+                req.fail(@errorName(e));
+                return;
+            };
+            self.pipeOkIndex(req, self.tabs.items.len - 1);
+        },
+        .open_browser => |url_opt| {
+            self.openBrowserTo(url_opt orelse "https://ghostty.org") catch |e| {
+                req.fail(@errorName(e));
+                return;
+            };
+            self.pipeOkIndex(req, self.tabs.items.len - 1);
+        },
+        .navigate => |nav| {
+            const pane = self.browserAt(nav.tab) orelse {
+                req.fail("tab is not a browser");
+                return;
+            };
+            pane.navigateTo(nav.url) catch |e| {
+                req.fail(@errorName(e));
+                return;
+            };
+            req.complete("{\"ok\":true}");
+        },
+        .eval => |ev| {
+            const pane = self.browserAt(ev.tab) orelse {
+                req.fail("tab is not a browser");
+                return;
+            };
+            pane.eval(ev.js, &onPipeEvalDone, req) catch |e| {
+                req.fail(@errorName(e));
+                return;
+            };
+            // Completed asynchronously by onPipeEvalDone.
+        },
+        .switch_tab => |idx| {
+            if (idx >= self.tabs.items.len) {
+                req.fail("no such tab");
+                return;
+            }
+            self.switchTab(idx);
+            req.complete("{\"ok\":true}");
+        },
+    }
+}
+
+fn browserAt(self: *Self, idx: usize) ?*BrowserPane {
+    if (idx >= self.tabs.items.len) return null;
+    return switch (self.tabs.items[idx]) {
+        .browser => |p| p,
+        .terminal => null,
+    };
+}
+
+fn pipeOkIndex(self: *Self, req: *PipeServer.Request, index: usize) void {
+    _ = self;
+    const resp = std.fmt.allocPrint(
+        std.heap.c_allocator,
+        "{{\"ok\":true,\"index\":{d}}}",
+        .{index},
+    ) catch {
+        req.complete("{\"ok\":true}");
+        return;
+    };
+    req.completeOwned(resp);
+}
+
+fn pipeList(self: *Self, req: *PipeServer.Request) void {
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const TabInfo = struct {
+        index: usize,
+        kind: []const u8,
+        title: []const u8,
+        active: bool,
+        url: ?[]const u8 = null,
+    };
+    var infos = std.array_list.Managed(TabInfo).init(a);
+    var lbl_buf: [260]u8 = undefined;
+    var url_buf: [4096]u8 = undefined;
+    for (self.tabs.items, 0..) |t, i| {
+        const label = self.friendlyLabel(i, &lbl_buf);
+        infos.append(.{
+            .index = i,
+            .kind = switch (t) {
+                .terminal => "terminal",
+                .browser => "browser",
+            },
+            .title = a.dupe(u8, label) catch "",
+            .active = i == self.active,
+            .url = switch (t) {
+                .browser => |p| if (p.currentUrl(&url_buf)) |u| (a.dupe(u8, u) catch null) else null,
+                .terminal => null,
+            },
+        }) catch {};
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer aw.deinit();
+    std.json.Stringify.value(
+        .{ .ok = true, .tabs = infos.items },
+        .{},
+        &aw.writer,
+    ) catch {
+        req.fail("serialize failed");
+        return;
+    };
+    req.complete(aw.written());
+}
+
+/// ExecuteScript completion (UI thread). The result is already JSON, so it
+/// embeds raw into the response envelope.
+fn onPipeEvalDone(ctx: ?*anyopaque, result_json: ?[*:0]const u16, ok: c_int) callconv(.c) void {
+    const req: *PipeServer.Request = @ptrCast(@alignCast(ctx orelse return));
+    if (ok == 0 or result_json == null) {
+        req.fail("script failed");
+        return;
+    }
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(
+        std.heap.c_allocator,
+        std.mem.span(result_json.?),
+    ) catch {
+        req.fail("utf8 conversion failed");
+        return;
+    };
+    defer std.heap.c_allocator.free(utf8);
+    const resp = std.fmt.allocPrint(
+        std.heap.c_allocator,
+        "{{\"ok\":true,\"result\":{s}}}",
+        .{utf8},
+    ) catch {
+        req.fail("oom");
+        return;
+    };
+    req.completeOwned(resp);
+}
+
 fn autoHeal(self: *Self) void {
     if (MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) == null) {
         var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
@@ -2432,6 +2595,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                     break;
                 }
             }
+            return 0;
+        },
+        WM_APP_PIPE_REQUEST => {
+            const req: *PipeServer.Request = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            self.handlePipeRequest(req);
             return 0;
         },
         WM_DESTROY => {

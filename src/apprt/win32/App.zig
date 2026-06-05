@@ -14,6 +14,7 @@ const CoreApp = @import("../../App.zig");
 const ParentWindow = @import("ParentWindow.zig");
 const ChromeWindow = @import("ChromeWindow.zig");
 const Surface = @import("Surface.zig");
+const PipeServer = @import("PipeServer.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -95,6 +96,10 @@ pending_command: ?[:0]const u8 = null,
 /// same drive/dir you're working in. Borrowed; valid only across the
 /// Surface.create call.
 pending_cwd: ?[]const u8 = null,
+/// Named-pipe control API (modern chrome only). Its name is exported to
+/// spawned shells as GHOSTTY_PIPE so `ghostty-ctl` inside a tab can find
+/// this window. null when the server failed to start (API disabled).
+pipe_server: ?*PipeServer = null,
 
 pub fn init(
     self: *App,
@@ -132,6 +137,12 @@ pub fn run(self: *App) !void {
     if (new_chrome) {
         const w = try ChromeWindow.create(self.core_app.alloc, self);
         self.chrome = .{ .modern = w };
+        // Start the control pipe before any tab spawns so the very first
+        // shell already sees GHOSTTY_PIPE in its environment.
+        self.pipe_server = PipeServer.start(self.core_app.alloc, w.hwnd) catch |e| blk: {
+            log.warn("pipe server failed to start: {}", .{e});
+            break :blk null;
+        };
     } else {
         const w = try ParentWindow.create(self.core_app.alloc, self);
         self.chrome = .{ .legacy = w };
@@ -170,6 +181,11 @@ pub fn run(self: *App) !void {
 
 pub fn terminate(self: *App) void {
     _ = self;
+}
+
+/// UTF-8 pipe name of the control API, if it's running.
+pub fn pipeName(self: *const App) ?[]const u8 {
+    return if (self.pipe_server) |p| p.pipeName() else null;
 }
 
 pub fn wakeup(self: *App) void {
