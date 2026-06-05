@@ -765,6 +765,7 @@ fn addWin32(
     step: *std.Build.Step.Compile,
 ) !void {
     _ = self;
+    const b = step.step.owner;
     step.linkSystemLibrary2("kernel32", .{});
     step.linkSystemLibrary2("user32", .{});
     step.linkSystemLibrary2("gdi32", .{});
@@ -777,6 +778,28 @@ fn addWin32(
     // d3dcompiler_47 is loaded at runtime via LoadLibrary (see
     // `renderer/d3d11/api.zig::loadD3DCompiler`). Linking the import lib
     // statically pulls libcmt.lib which expects a WinMain entry point.
+
+    // WebView2 (embedded browser panes). The C++ shim bridges the COM API
+    // to a tiny C ABI. Built no-libcxx like the simd sources: custom
+    // operator new/delete live in the shim, so -fno-exceptions/-fno-rtti
+    // and ubsan-off keep us off the C++ runtime. WebView2Loader.dll is
+    // resolved at runtime (LoadLibrary, same idiom as d3dcompiler_47) and
+    // installed beside the exe below — its static variant is MSVC-only
+    // (pulls __security_cookie / _Init_thread_* / MSVC-mangled operators
+    // that mingw can't satisfy).
+    step.addIncludePath(b.path("vendor/webview2/include"));
+    step.addCSourceFile(.{
+        .file = b.path("src/apprt/win32/webview2_shim.cpp"),
+        .flags = &.{
+            "-std=c++17",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-fno-sanitize=undefined",
+            "-fno-sanitize-trap=undefined",
+        },
+    });
+    step.linkSystemLibrary2("ole32", .{}); // CoInitializeEx + COM
+    b.installBinFile("vendor/webview2/x64/WebView2Loader.dll", "WebView2Loader.dll");
 }
 
 /// Add only the dependencies required for `Config.simd` enabled. This also

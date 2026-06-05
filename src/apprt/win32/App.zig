@@ -73,6 +73,14 @@ pub const Chrome = union(enum) {
             inline else => |p| p.active,
         };
     }
+    /// Toggle the embedded WebView2 browser pane. Only the modern chrome
+    /// implements it; the legacy GDI tab strip is a no-op.
+    pub fn openBrowser(self: Chrome) void {
+        switch (self) {
+            .modern => |p| p.openBrowser(),
+            .legacy => {},
+        }
+    }
 };
 
 core_app: *CoreApp,
@@ -145,6 +153,15 @@ pub fn run(self: *App) !void {
     } else {
         log.info("App.run: restored previous session", .{});
     }
+
+    // Dev/test hook: GHOSTTY_OPEN_BROWSER=1 auto-opens the embedded browser
+    // pane once at startup. Lets the WebView2 path be exercised without
+    // synthesizing the Ctrl+Shift+B chord (injected modifiers don't reliably
+    // reach GetKeyState). Harmless when unset.
+    if (std.process.getEnvVarOwned(self.core_app.alloc, "GHOSTTY_OPEN_BROWSER")) |val| {
+        defer self.core_app.alloc.free(val);
+        if (val.len > 0 and val[0] != '0') self.chrome.?.openBrowser();
+    } else |_| {}
 
     log.info("App.run: entering message pump", .{});
     try self.chrome.?.run();

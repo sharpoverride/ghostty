@@ -1186,6 +1186,11 @@ fn forwardKey(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, action: input.Action) 
                 chrome.newTab() catch |e| log.warn("newTab failed: {}", .{e});
                 return;
             }
+            // Ctrl+Shift+B → toggle the embedded browser pane (slice 1).
+            if (mods.shift and vk == 0x42) {
+                chrome.openBrowser();
+                return;
+            }
             // Ctrl+W → close current tab (without shift; Ctrl+Shift+W
             // historically opens history in some apps, avoid collision).
             if (!mods.shift and vk == 0x57) {

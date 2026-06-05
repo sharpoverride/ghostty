@@ -18,6 +18,52 @@ const Allocator = std.mem.Allocator;
 const Surface = @import("Surface.zig");
 const ApprtApp = @import("App.zig");
 const session = @import("session.zig");
+const BrowserPane = @import("BrowserPane.zig");
+
+/// A tab's content: either a terminal surface or an embedded browser. Both
+/// own a child HWND in the content rect, so the chrome's show/hide/layout/
+/// close machinery treats them uniformly via the accessors below.
+pub const Tab = union(enum) {
+    terminal: *Surface,
+    browser: *BrowserPane,
+
+    /// The child HWND the chrome positions/shows for this tab.
+    pub fn hwnd(self: Tab) windows.HWND {
+        return switch (self) {
+            .terminal => |s| s.window.hwnd,
+            .browser => |b| b.host_hwnd,
+        };
+    }
+    pub fn deinit(self: Tab) void {
+        switch (self) {
+            inline else => |p| p.deinit(),
+        }
+    }
+    pub fn titleOpt(self: Tab) ?[]const u8 {
+        return switch (self) {
+            inline else => |p| p.title,
+        };
+    }
+    pub fn isPinned(self: Tab) bool {
+        return switch (self) {
+            inline else => |p| p.title_pinned,
+        };
+    }
+    /// Replace the title (c_allocator-owned to match how titles are stored).
+    pub fn setTitle(self: Tab, title: ?[]u8) void {
+        switch (self) {
+            inline else => |p| {
+                if (p.title) |old| std.heap.c_allocator.free(old);
+                p.title = title;
+            },
+        }
+    }
+    pub fn pin(self: Tab) void {
+        switch (self) {
+            inline else => |p| p.title_pinned = true,
+        }
+    }
+};
 
 const HWND = windows.HWND;
 const HINSTANCE = windows.HINSTANCE;
@@ -600,6 +646,7 @@ const ICON_SETTINGS: u16 = 0xE713; // Settings (gear)
 const ICON_TILES: u16 = 0xE80A; // Tiles
 const ICON_NEW_TAB: u16 = 0xE710; // Add (+)
 const ICON_TAB_PROMPT: u16 = 0xE756; // CommandPrompt (>_)
+const ICON_TAB_BROWSER: u16 = 0xE774; // Globe (browser tab)
 
 // ---------------------------------------------------------------------------
 // Public state.
@@ -608,8 +655,8 @@ const ICON_TAB_PROMPT: u16 = 0xE756; // CommandPrompt (>_)
 alloc: Allocator,
 app: *ApprtApp,
 hwnd: HWND,
-/// One Surface per tab (single tab today; tab list UI lands in slice 2).
-tabs: std.array_list.Managed(*Surface),
+/// One entry per tab — a terminal surface or an embedded browser pane.
+tabs: std.array_list.Managed(Tab),
 active: usize = 0,
 
 // D2D resources. Recreated on demand if EndDraw returns D2DERR_RECREATE_TARGET.
@@ -721,7 +768,7 @@ pub fn create(alloc: Allocator, app: *ApprtApp) !*Self {
         .alloc = alloc,
         .app = app,
         .hwnd = undefined,
-        .tabs = std.array_list.Managed(*Surface).init(alloc),
+        .tabs = std.array_list.Managed(Tab).init(alloc),
         .shells = std.array_list.Managed(Shell).init(alloc),
     };
     self.detectShells() catch |e| log.warn("shell detection failed: {}", .{e});
@@ -847,7 +894,7 @@ pub fn deinit(self: *Self) void {
         _ = f.vtbl.Release(f);
         self.d2d_factory = null;
     }
-    for (self.tabs.items) |s| s.deinit();
+    for (self.tabs.items) |t| t.deinit();
     self.tabs.deinit();
     for (self.shells.items) |sh| {
         self.alloc.free(sh.name);
@@ -892,13 +939,32 @@ pub fn run(self: *Self) !void {
     _ = self;
 }
 
+/// The active tab's terminal surface, or null if there are no tabs or the
+/// active tab is a browser. Terminal-only callers (cwd inheritance, session
+/// save, focus-return) use this; generic callers use `activeTab`.
 pub fn activeSurface(self: *const Self) ?*Surface {
+    const t = self.activeTab() orelse return null;
+    return switch (t) {
+        .terminal => |s| s,
+        .browser => null,
+    };
+}
+
+pub fn activeTab(self: *const Self) ?Tab {
     if (self.tabs.items.len == 0) return null;
     return self.tabs.items[self.active];
 }
 
 pub fn appendTab(self: *Self, surface: *Surface) !void {
-    try self.tabs.append(surface);
+    try self.tabs.append(.{ .terminal = surface });
+    self.active = self.tabs.items.len - 1;
+    self.applyActiveVisibility();
+    self.layoutActive();
+}
+
+/// Append a browser pane as a new tab and switch to it.
+fn appendBrowserTab(self: *Self, pane: *BrowserPane) !void {
+    try self.tabs.append(.{ .browser = pane });
     self.active = self.tabs.items.len - 1;
     self.applyActiveVisibility();
     self.layoutActive();
@@ -970,7 +1036,12 @@ fn saveSession(self: *Self) void {
     var blobs = std.array_list.Managed([]const u8).init(a);
 
     var lbl_buf: [260]u8 = undefined;
-    for (self.tabs.items, 0..) |s, i| {
+    for (self.tabs.items, 0..) |t, i| {
+        // Browser tabs aren't persisted yet (slice 4 handles URL restore).
+        const s = switch (t) {
+            .terminal => |surf| surf,
+            .browser => continue,
+        };
         // Title: store the user's pinned name verbatim, else the friendly
         // label (restore re-derives unpinned names from the fresh shell).
         const title = if (s.title_pinned and s.title != null)
@@ -1049,7 +1120,8 @@ pub fn restoreSession(self: *Self) bool {
                 continue;
             };
         }
-        const surf = self.tabs.items[self.tabs.items.len - 1];
+        // Restored tabs are always terminals (created via newTab above).
+        const surf = self.tabs.items[self.tabs.items.len - 1].terminal;
 
         // Hand the saved scrollback to termio, which replays it
         // deterministically right after the relaunched shell's startup
@@ -1165,10 +1237,10 @@ fn commitRename(self: *Self) void {
     const idx = self.renaming orelse return;
     self.renaming = null;
     if (idx >= self.tabs.items.len) return;
-    const surf = self.tabs.items[idx];
-    if (surf.title) |old| self.alloc.free(old);
-    surf.title = self.alloc.dupe(u8, self.rename_buf[0..self.rename_len]) catch null;
-    surf.title_pinned = true; // OSC 0/1/2 from now on will be ignored.
+    const tab = self.tabs.items[idx];
+    const renamed = std.heap.c_allocator.dupe(u8, self.rename_buf[0..self.rename_len]) catch null;
+    tab.setTitle(renamed);
+    tab.pin(); // OSC 0/1/2 from now on will be ignored.
     // Return focus to the active terminal so typing resumes there.
     if (self.activeSurface()) |s| _ = SetFocus(s.window.hwnd);
     _ = InvalidateRect(self.hwnd, null, FALSE);
@@ -1251,6 +1323,8 @@ fn showNewTabMenu(self: *Self) void {
     defer _ = DestroyMenu(menu);
 
     // Build menu items. ID 0 reserved as "no selection"; we start at 1.
+    // Shell IDs are 1..shells.len; the browser uses a high sentinel ID so it
+    // never collides with a shell index.
     var w_buf: [256]u16 = undefined;
     for (self.shells.items, 0..) |sh, i| {
         const wlen = std.unicode.utf8ToUtf16Le(&w_buf, sh.name) catch continue;
@@ -1258,6 +1332,11 @@ fn showNewTabMenu(self: *Self) void {
         w_buf[wlen] = 0;
         _ = AppendMenuW(menu, MF_STRING, i + 1, @ptrCast(&w_buf));
     }
+
+    // "Browser" — opens a WebView2 tab instead of a shell.
+    _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    const browser_label = std.unicode.utf8ToUtf16LeStringLiteral("Browser");
+    _ = AppendMenuW(menu, MF_STRING, BROWSER_MENU_ID, browser_label.ptr);
 
     // Anchor the menu to the bottom-left of the "+" button in screen coords.
     const r = self.headerBtnRectDip(headerCtrlIndex(.new_tab));
@@ -1278,6 +1357,10 @@ fn showNewTabMenu(self: *Self) void {
         null,
     );
     if (id <= 0) return; // canceled
+    if (id == BROWSER_MENU_ID) {
+        self.openBrowser();
+        return;
+    }
     const idx: usize = @intCast(@as(usize, @intCast(id)) - 1);
     if (idx >= self.shells.items.len) return;
     const cmd = self.shells.items[idx].command;
@@ -1285,10 +1368,14 @@ fn showNewTabMenu(self: *Self) void {
         log.warn("newTabWithCommand failed: {}", .{e});
 }
 
+/// Popup-menu command ID for the "Browser" entry. Well above any shell index
+/// (1..shells.len) so the two never collide.
+const BROWSER_MENU_ID: usize = 1000;
+
 pub fn closeTab(self: *Self, idx: usize) void {
     if (idx >= self.tabs.items.len) return;
-    const surface = self.tabs.orderedRemove(idx);
-    surface.deinit();
+    const tab = self.tabs.orderedRemove(idx);
+    tab.deinit();
     if (self.tabs.items.len == 0) {
         PostQuitMessage(0);
         return;
@@ -1392,26 +1479,29 @@ fn headerHeight(self: *const Self) i32 {
 }
 
 fn applyActiveVisibility(self: *Self) void {
-    for (self.tabs.items, 0..) |s, i| {
+    for (self.tabs.items, 0..) |t, i| {
         const cmd: i32 = if (i == self.active) 5 else 0; // SW_SHOW vs SW_HIDE
-        _ = ShowWindow(s.window.hwnd, cmd);
+        _ = ShowWindow(t.hwnd(), cmd);
     }
-    if (self.activeSurface()) |active| _ = SetFocus(active.window.hwnd);
+    // Focus the active tab's child so keyboard input lands there (the
+    // terminal, or the browser host which forwards into the WebView).
+    if (self.activeTab()) |t| _ = SetFocus(t.hwnd());
 }
 
 fn layoutActive(self: *Self) void {
-    const surface = self.activeSurface() orelse return;
+    const tab = self.activeTab() orelse return;
     const sb = self.sidebarWidth();
     var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = GetClientRect(self.hwnd, &rect);
-    // Terminal fills the entire area to the right of the sidebar, from the
-    // top of the client area down. There's no top header strip in the
-    // modern chrome — the hamburger/new-tab buttons live in the sidebar's
-    // own top region, so the console gets the full height beside it.
+    // The active tab's content (terminal or browser host) fills the entire
+    // area to the right of the sidebar, from the top of the client area
+    // down. There's no top header strip in the modern chrome — the
+    // hamburger/new-tab buttons live in the sidebar's own top region.
     const w = @max(0, rect.right - rect.left - sb);
     const h = @max(0, rect.bottom - rect.top);
+    const child = tab.hwnd();
     _ = SetWindowPos(
-        surface.window.hwnd,
+        child,
         null,
         sb,
         0,
@@ -1419,8 +1509,33 @@ fn layoutActive(self: *Self) void {
         h,
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
-    _ = InvalidateRect(surface.window.hwnd, null, FALSE);
+    _ = InvalidateRect(child, null, FALSE);
     _ = InvalidateRect(self.hwnd, null, FALSE);
+
+    // Browser tabs: resize the WebView to fill its (now-sized) host.
+    if (tab == .browser) tab.browser.setBounds(w, h);
+}
+
+/// Open a new browser tab (WebView2) navigating to a fixed URL and switch
+/// to it. Driven by Ctrl+Shift+B (Window.zig forwardKey → Chrome.openBrowser).
+pub fn openBrowser(self: *Self) void {
+    const sb = self.sidebarWidth();
+    var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = GetClientRect(self.hwnd, &rect);
+    const w = @max(0, rect.right - rect.left - sb);
+    const h = @max(0, rect.bottom - rect.top);
+    const url = std.unicode.utf8ToUtf16LeStringLiteral("https://ghostty.org");
+    const pane = BrowserPane.create(self.alloc, self.hwnd, sb, 0, w, h, url.ptr) catch |e| {
+        log.warn("openBrowser: BrowserPane.create failed: {}", .{e});
+        return;
+    };
+    self.appendBrowserTab(pane) catch |e| {
+        log.warn("openBrowser: appendBrowserTab failed: {}", .{e});
+        pane.deinit();
+        return;
+    };
+    _ = InvalidateRect(self.hwnd, null, FALSE);
+    log.info("openBrowser: browser tab opened", .{});
 }
 
 fn autoHeal(self: *Self) void {
@@ -1643,8 +1758,15 @@ fn searchFieldRectDip(self: *const Self) D2D1_RECT_F {
 /// Writes into `buf` when transformation is needed; otherwise returns a
 /// slice that may alias the surface title or a static string.
 fn friendlyLabel(self: *const Self, i: usize, buf: []u8) []const u8 {
-    const surf = self.tabs.items[i];
-    const title = surf.title orelse
+    const tab = self.tabs.items[i];
+    // Browser tabs: use the (renamed) title, else a generic "Browser N".
+    if (tab == .browser) {
+        if (tab.titleOpt()) |t| {
+            if (t.len > 0) return t;
+        }
+        return std.fmt.bufPrint(buf, "Browser {d}", .{i + 1}) catch "Browser";
+    }
+    const title = tab.titleOpt() orelse
         return std.fmt.bufPrint(buf, "Terminal {d}", .{i + 1}) catch "Terminal";
     if (title.len == 0)
         return std.fmt.bufPrint(buf, "Terminal {d}", .{i + 1}) catch "Terminal";
@@ -1882,8 +2004,11 @@ fn paintTabRows(
         if (text_brush_opt == null) continue;
         const text_brush: *ID2D1Brush = @ptrCast(text_brush_opt.?);
 
-        // Leading icon (shell-type glyph; slice 4 will pick per-shell).
-        const icon_glyph = [_]u16{ICON_TAB_PROMPT};
+        // Leading icon: globe for browser tabs, prompt glyph for terminals
+        // (slice 4 will pick per-shell terminal glyphs).
+        const icon_glyph = [_]u16{
+            if (self.tabs.items[i] == .browser) ICON_TAB_BROWSER else ICON_TAB_PROMPT,
+        };
         rt.vtbl.DrawText(
             rt,
             &icon_glyph,
@@ -2240,12 +2365,16 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 std.heap.c_allocator.free(tt.title);
                 std.heap.c_allocator.destroy(tt);
             }
-            // Find the tab for this surface and update its title.
-            for (self.tabs.items) |s| {
+            // Find the terminal tab for this surface and update its title.
+            for (self.tabs.items) |t| {
+                const s = switch (t) {
+                    .terminal => |surf| surf,
+                    .browser => continue,
+                };
                 if (s == tt.surface) {
                     if (s.title_pinned) break; // user renamed; ignore OSC.
-                    if (s.title) |old| self.alloc.free(old);
-                    s.title = self.alloc.dupe(u8, tt.title) catch null;
+                    if (s.title) |old| std.heap.c_allocator.free(old);
+                    s.title = std.heap.c_allocator.dupe(u8, tt.title) catch null;
                     _ = InvalidateRect(hwnd, null, FALSE);
                     break;
                 }
@@ -2254,8 +2383,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         WM_APP_CLOSE_SURFACE => {
             const target: *Surface = @ptrFromInt(@as(usize, @intCast(wparam)));
-            for (self.tabs.items, 0..) |s, i| {
-                if (s == target) {
+            for (self.tabs.items, 0..) |t, i| {
+                if (t == .terminal and t.terminal == target) {
                     self.closeTab(i);
                     break;
                 }
