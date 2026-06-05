@@ -75,6 +75,7 @@ pub const Command = union(enum) {
     navigate: struct { tab: usize, url: []const u8 },
     eval: struct { tab: usize, js: []const u8 },
     switch_tab: usize,
+    close_tab: usize,
 };
 
 /// One in-flight request. Created by the server thread, completed exactly
@@ -294,6 +295,8 @@ fn buildRequest(self: *PipeServer, line: []const u8) !*Request {
         } }
     else if (std.mem.eql(u8, wire.cmd, "switch"))
         .{ .switch_tab = wire.tab orelse return error.MissingTab }
+    else if (std.mem.eql(u8, wire.cmd, "close"))
+        .{ .close_tab = wire.tab orelse return error.MissingTab }
     else
         return error.UnknownCommand;
 

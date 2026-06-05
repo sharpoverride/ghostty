@@ -117,6 +117,7 @@ const WM_KEYDOWN: UINT = 0x0100;
 const WM_CHAR: UINT = 0x0102;
 const WM_KILLFOCUS: UINT = 0x0008;
 const WM_LBUTTONDOWN: UINT = 0x0201;
+const WM_MBUTTONDOWN: UINT = 0x0207;
 const WM_LBUTTONUP: UINT = 0x0202;
 const WM_LBUTTONDBLCLK: UINT = 0x0203;
 const WM_MOUSELEAVE: UINT = 0x02A3;
@@ -269,6 +270,11 @@ const WM_APP_SET_TAB_TITLE: UINT = WM_APP + 4;
 /// Pipe API request marshaled from the server thread; lparam = *Request.
 /// Value mirrored in PipeServer.WM_APP_PIPE_REQUEST.
 const WM_APP_PIPE_REQUEST: UINT = WM_APP + 5;
+/// Chrome chord forwarded from a focused WebView2 (BrowserPane.onAccel):
+/// wparam = vk | 0x100 when shift, lparam = *BrowserPane that sent it.
+/// Value mirrored in BrowserPane.WM_APP_BROWSER_CHORD. Posted (not sent)
+/// so tab teardown never happens inside a WebView2 event callback.
+const WM_APP_BROWSER_CHORD: UINT = WM_APP + 6;
 const TabTitleMsg = struct { surface: *Surface, title: []u8 };
 
 // ---------------------------------------------------------------------------
@@ -651,6 +657,7 @@ const ICON_TILES: u16 = 0xE80A; // Tiles
 const ICON_NEW_TAB: u16 = 0xE710; // Add (+)
 const ICON_TAB_PROMPT: u16 = 0xE756; // CommandPrompt (>_)
 const ICON_TAB_BROWSER: u16 = 0xE774; // Globe (browser tab)
+const ICON_TAB_CLOSE: u16 = 0xE711; // Cancel (close x on tab rows)
 
 // ---------------------------------------------------------------------------
 // Public state.
@@ -1414,6 +1421,13 @@ const BROWSER_MENU_ID: usize = 1000;
 
 pub fn closeTab(self: *Self, idx: usize) void {
     if (idx >= self.tabs.items.len) return;
+    // Park focus on the chrome BEFORE teardown. If the dying tab's window
+    // owns focus, destroying it mid-deinit triggers synchronous
+    // WM_KILLFOCUS delivery into half-torn-down state (renderer joined,
+    // surface freed) — observed as a use-after-free segfault when closing
+    // the active tab. With focus parked here, the later
+    // applyActiveVisibility SetFocus storm only touches live windows.
+    _ = SetFocus(self.hwnd);
     const tab = self.tabs.orderedRemove(idx);
     tab.deinit();
     if (self.tabs.items.len == 0) {
@@ -1647,6 +1661,17 @@ fn handlePipeRequest(self: *Self, req: *PipeServer.Request) void {
             }
             self.switchTab(idx);
             req.complete("{\"ok\":true}");
+        },
+        .close_tab => |idx| {
+            if (idx >= self.tabs.items.len) {
+                req.fail("no such tab");
+                return;
+            }
+            // Answer BEFORE closing: closing the last tab posts WM_QUIT and
+            // the server thread dies with the process — the client would
+            // never get its response.
+            req.complete("{\"ok\":true}");
+            self.closeTab(idx);
         },
     }
 }
@@ -2090,6 +2115,40 @@ fn hitTabRow(self: *const Self, x_px: i32, y_px: i32) ?usize {
     return null;
 }
 
+/// Square (DIPs) of the close "x" at the right edge of a tab pill. Painted
+/// on the hovered/active row; hit-tested for every row (you can't click an
+/// unpainted one — moving the mouse there hovers the row first).
+fn tabCloseRectDip(pill: D2D1_RECT_F) D2D1_RECT_F {
+    const sq: f32 = 18;
+    const pad: f32 = 7;
+    const cy = (pill.top + pill.bottom) / 2;
+    return .{
+        .left = pill.right - pad - sq,
+        .top = cy - sq / 2,
+        .right = pill.right - pad,
+        .bottom = cy + sq / 2,
+    };
+}
+
+/// Tab index whose close "x" is under the mouse, if any. Disabled in the
+/// icon-only rail (no room for the glyph there).
+fn hitTabClose(self: *const Self, x_px: i32, y_px: i32) ?usize {
+    if (self.collapsed) return null;
+    if (self.tabs.items.len == 0) return null;
+    const dpi: i32 = self.currentDpi();
+    const fx: f32 = @as(f32, @floatFromInt(x_px * 96)) / @as(f32, @floatFromInt(dpi));
+    const fy: f32 = @as(f32, @floatFromInt(y_px * 96)) / @as(f32, @floatFromInt(dpi));
+    var visible_idx: usize = 0;
+    var i: usize = 0;
+    while (i < self.tabs.items.len) : (i += 1) {
+        if (!self.tabMatchesQuery(i)) continue;
+        const r = tabCloseRectDip(self.tabGeomAt(visible_idx).pill);
+        if (fx >= r.left and fx < r.right and fy >= r.top and fy < r.bottom) return i;
+        visible_idx += 1;
+    }
+    return null;
+}
+
 /// Render the "Search tabs..." input field above the tab list.
 fn paintSearchField(self: *Self, rt: *ID2D1HwndRenderTarget) void {
     const tf = self.tab_text_format orelse return;
@@ -2243,16 +2302,33 @@ fn paintTabRows(
             label_utf8 = self.friendlyLabel(i, &fbuf);
         }
         const wlen = std.unicode.utf8ToUtf16Le(&name_buf, label_utf8) catch name_buf.len;
+        // Keep the title clear of the close "x" on rows that show one.
+        var text_rect = g.text;
+        if (is_active or is_hover) {
+            const cr = tabCloseRectDip(g.pill);
+            if (text_rect.right > cr.left - 2) text_rect.right = cr.left - 2;
+        }
         rt.vtbl.DrawText(
             rt,
             &name_buf,
             @intCast(wlen),
             tf,
-            &g.text,
+            &text_rect,
             text_brush,
             0,
             0,
         );
+
+        // Close "x" on the hovered/active row.
+        if (is_active or is_hover) {
+            const close_glyph = [_]u16{ICON_TAB_CLOSE};
+            const cr = tabCloseRectDip(g.pill);
+            const close_brush: *ID2D1Brush = if (self.brush_text_dim) |db|
+                @ptrCast(db)
+            else
+                text_brush;
+            rt.vtbl.DrawText(rt, &close_glyph, 1, icon_tf, &cr, close_brush, 0, 0);
+        }
     }
 }
 
@@ -2528,8 +2604,23 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 }
                 return 0;
             }
+            if (self.hitTabClose(x, y)) |idx| {
+                self.closeTab(idx);
+                _ = InvalidateRect(hwnd, null, FALSE);
+                return 0;
+            }
             if (self.hitTabRow(x, y)) |idx| {
                 self.switchTab(idx);
+                _ = InvalidateRect(hwnd, null, FALSE);
+            }
+            return 0;
+        },
+        WM_MBUTTONDOWN => {
+            // Middle-click anywhere on a tab row closes it.
+            const x: i32 = @intCast(@as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)))))));
+            const y: i32 = @intCast(@as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) >> 16)))));
+            if (self.hitTabRow(x, y)) |idx| {
+                self.closeTab(idx);
                 _ = InvalidateRect(hwnd, null, FALSE);
             }
             return 0;
@@ -2600,6 +2691,27 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_APP_PIPE_REQUEST => {
             const req: *PipeServer.Request = @ptrFromInt(@as(usize, @bitCast(lparam)));
             self.handlePipeRequest(req);
+            return 0;
+        },
+        WM_APP_BROWSER_CHORD => {
+            const vk: u32 = @intCast(wparam & 0xFF);
+            const shift = (wparam & 0x100) != 0;
+            // Validate the sender still exists — the post is async and the
+            // tab could have been closed in between.
+            const pane: *BrowserPane = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const idx = for (self.tabs.items, 0..) |t, i| {
+                if (t == .browser and t.browser == pane) break i;
+            } else return 0;
+            switch (vk) {
+                'W' => self.closeTab(idx),
+                'T' => if (shift) self.newTab() catch |e|
+                    log.warn("newTab failed: {}", .{e}),
+                'B' => if (shift) self.openBrowser(),
+                0x09 => self.cycleTab(if (shift) -1 else 1), // Ctrl+Tab
+                '1'...'9' => self.switchTab(@intCast(vk - '1')),
+                else => {},
+            }
+            _ = InvalidateRect(hwnd, null, FALSE);
             return 0;
         },
         WM_DESTROY => {

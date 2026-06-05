@@ -65,6 +65,7 @@ const usage =
     \\  navigate <tab> <url>   navigate a browser tab
     \\  eval <tab> <js>        evaluate JS in a browser tab, print result
     \\  switch <tab>           activate a tab
+    \\  close <tab>            close a tab
     \\
     \\pipe: GHOSTTY_PIPE env (set inside ghostty shells) or --pipe
 ;
@@ -121,6 +122,12 @@ pub fn main() !void {
             if (rest.len < 1) die(usage);
             break :blk .{
                 .cmd = "switch",
+                .tab = std.fmt.parseInt(usize, rest[0], 10) catch die("bad tab index"),
+            };
+        } else if (std.mem.eql(u8, cmd, "close")) {
+            if (rest.len < 1) die(usage);
+            break :blk .{
+                .cmd = "close",
                 .tab = std.fmt.parseInt(usize, rest[0], 10) catch die("bad tab index"),
             };
         }

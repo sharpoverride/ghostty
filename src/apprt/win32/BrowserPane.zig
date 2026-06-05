@@ -54,7 +54,13 @@ const VK_RETURN: WPARAM = 0x0D;
 const VK_ESCAPE: WPARAM = 0x1B;
 const VK_CONTROL_I: i32 = 0x11;
 const VK_MENU_I: i32 = 0x12;
+const VK_SHIFT_I: i32 = 0x10;
 const EM_SETSEL: UINT = 0x00B1;
+
+/// Chrome chord forwarded to the chrome window when web content has focus.
+/// wparam = vk | 0x100 when shift, lparam = *Self. Value mirrored in
+/// ChromeWindow.WM_APP_BROWSER_CHORD.
+const WM_APP_BROWSER_CHORD: UINT = 0x8000 + 6;
 
 const GWLP_WNDPROC: i32 = -4;
 const GWLP_USERDATA: i32 = -21;
@@ -91,6 +97,7 @@ extern "user32" fn MoveWindow(hWnd: HWND, X: i32, Y: i32, nWidth: i32, nHeight: 
 extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 extern "user32" fn SetFocus(hWnd: ?HWND) callconv(.winapi) ?HWND;
 extern "user32" fn GetKeyState(nVirtKey: i32) callconv(.winapi) i16;
+extern "user32" fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
 extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const anyopaque, bErase: BOOL) callconv(.winapi) BOOL;
 extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) UINT;
 extern "gdi32" fn CreateFontW(
@@ -420,11 +427,35 @@ fn onSourceChanged(ctx: ?*anyopaque, url: [*:0]const u16) callconv(.c) void {
 /// AcceleratorKeyPressed (UI thread): browser-pane shortcuts while focus
 /// is inside the web content. Ctrl+L focuses the bar (select-all, like
 /// every browser), Alt+Left/Right navigate history, Ctrl+R / F5 reload.
+/// Chrome-level chords (Ctrl+W/T/Shift+B/Tab/1-9) are POSTED to the chrome
+/// window so tab management works with a browser tab focused, and so tab
+/// teardown never runs inside this WebView2 event callback.
 fn onAccel(ctx: ?*anyopaque, vk: c_uint) callconv(.c) c_int {
     const self: *Self = @ptrCast(@alignCast(ctx orelse return 0));
     const b = self.browser orelse return 0;
     const ctrl = GetKeyState(VK_CONTROL_I) < 0;
     const alt = GetKeyState(VK_MENU_I) < 0;
+
+    if (ctrl) {
+        const shift = GetKeyState(VK_SHIFT_I) < 0;
+        const forward = switch (vk) {
+            'W' => !shift, // close tab
+            'T', 'B' => shift, // new tab / new browser tab
+            0x09 => true, // Ctrl+Tab cycle (shift = backwards)
+            '1'...'9' => !shift, // direct tab selection
+            else => false,
+        };
+        if (forward) {
+            _ = PostMessageW(
+                self.chrome_hwnd,
+                WM_APP_BROWSER_CHORD,
+                @as(usize, vk) | (if (shift) @as(usize, 0x100) else 0),
+                @bitCast(@intFromPtr(self)),
+            );
+            return 1;
+        }
+    }
+
     switch (vk) {
         'L' => if (ctrl) {
             _ = SetFocus(self.url_edit);

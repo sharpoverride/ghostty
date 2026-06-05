@@ -180,6 +180,12 @@ pub fn deinit(self: *Self) void {
     // dispatched to us mid-teardown.
     self.app.core_app.deleteSurface(self);
 
+    // Detach the window's back-pointer so any message that still lands on
+    // the HWND during teardown (focus churn, paints) no-ops instead of
+    // dereferencing a half-destroyed surface — every forward* in Window.zig
+    // guards on `self.surface orelse return`.
+    self.window.surface = null;
+
     if (self.title) |t| std.heap.c_allocator.free(t);
     if (self.launch_command) |c| std.heap.c_allocator.free(c);
     if (self.pending_preamble) |p| std.heap.c_allocator.free(p);
